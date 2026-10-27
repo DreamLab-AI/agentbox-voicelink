@@ -109,8 +109,13 @@ impl std::fmt::Debug for Shared {
 }
 
 impl Client {
-    /// Spawns `tmux [-L|-S] -C attach -t =session [-f flags]` and starts the
-    /// reader and writer tasks.
+    /// Spawns `tmux -u [-L|-S] -C attach -t =session [-f flags]` and starts
+    /// the reader and writer tasks.
+    ///
+    /// `-u` makes tmux treat the client as UTF-8 whatever the locale: without
+    /// it, a client spawned with no `LANG`/`LC_*` (as under a bare
+    /// `docker exec`) gets tabs and other control characters in command
+    /// output replaced with `_`, which breaks tab-separated formats.
     ///
     /// Returns immediately; if the session does not exist, the first
     /// [`command`](Client::command) fails with [`Error::Closed`] carrying
@@ -124,7 +129,8 @@ impl Client {
         options: &ClientOptions,
     ) -> Result<(Client, Notifications), Error> {
         let mut cmd = Command::new(&options.program);
-        cmd.args(socket.args())
+        cmd.arg("-u")
+            .args(socket.args())
             .arg("-C")
             .arg("attach")
             .arg("-t")

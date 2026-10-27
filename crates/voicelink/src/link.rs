@@ -586,6 +586,9 @@ pub(crate) fn ssh_args(control_path: &Path, c: &Connection) -> Vec<String> {
         .map(|s| s.to_string())
         .collect();
     remote.push(c.container_user.clone());
+    // A bare `docker exec` has no locale; tmux then sanitises the tabs in
+    // voice-paned's formats to `_` and every query fails (same as connect.rs).
+    remote.extend(["-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8"].map(str::to_string));
     remote.push(c.container.clone());
     remote.extend(c.paned_command.split_whitespace().map(str::to_string));
     remote.push("--stdio".into());
@@ -1016,7 +1019,7 @@ mod tests {
         assert_eq!(&args[7..10], ["-p", "2222", "john@10.0.0.5"]);
         assert_eq!(
             args[10],
-            "docker exec -i --user 1000 agentbox /opt/agentbox/bin/voice-paned --stdio --session 'my session'"
+            "docker exec -i --user 1000 -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 agentbox /opt/agentbox/bin/voice-paned --stdio --session 'my session'"
         );
     }
 

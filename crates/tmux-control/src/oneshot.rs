@@ -9,7 +9,9 @@ use crate::error::Error;
 use crate::socket::Socket;
 
 async fn raw<S: AsRef<OsStr>>(socket: &Socket, args: &[S]) -> Result<Output, Error> {
+    // `-u`: see `Client::attach`; output must not depend on the locale.
     let out = Command::new("tmux")
+        .arg("-u")
         .args(socket.args())
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -28,7 +30,7 @@ fn failure(out: &Output) -> Error {
     })
 }
 
-/// Runs `tmux [-L|-S] args...` once, outside control mode, and returns its
+/// Runs `tmux -u [-L|-S] args...` once, outside control mode, and returns its
 /// standard output.
 ///
 /// Arguments are passed as an argv vector, never through a shell, so no

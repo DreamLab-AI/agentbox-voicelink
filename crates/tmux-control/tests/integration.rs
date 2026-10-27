@@ -126,6 +126,36 @@ async fn commands_return_output_and_errors() {
 }
 
 #[tokio::test]
+async fn output_keeps_tabs_without_a_utf8_locale() {
+    let Some(srv) = Server::start("base") else {
+        return;
+    };
+    // A bare `docker exec` runs with no locale; tmux then replaces control
+    // characters in output with `_` unless the client is started with `-u`.
+    let wrapper = srv.dir.path().join("tmux-no-locale");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\nexec env -u LANG -u LC_ALL -u LC_CTYPE tmux \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &wrapper,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let options = ClientOptions::new("base")
+        .flag("no-output")
+        .program(&wrapper);
+    let (client, _rx) = Client::attach(&srv.socket(), &options).unwrap();
+    let lines = client
+        .command(&command_line(["display-message", "-p", "a\tb"]))
+        .await
+        .unwrap();
+    assert_eq!(lines, ["a\tb"]);
+    client.detach().await;
+}
+
+#[tokio::test]
 async fn invalid_commands_are_refused_locally() {
     let Some(srv) = Server::start("base") else {
         return;
