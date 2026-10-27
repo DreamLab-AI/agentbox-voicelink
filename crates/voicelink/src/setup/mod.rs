@@ -1,6 +1,6 @@
 //! Onboarding wizard: `voicelink setup`.
 //!
-//! The interactive wizard ([`ui`]) drives a pure state machine ([`wizard`]);
+//! The interactive wizard (`ui`) drives a pure state machine ([`wizard`]);
 //! `--non-interactive` builds the same configuration from flags. Either way
 //! the terminal belongs to setup only until it returns, which is before the
 //! launcher hands it to tmux (I6).

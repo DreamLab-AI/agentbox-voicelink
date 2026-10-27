@@ -24,3 +24,6 @@ workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+async-trait.workspace = true
+# The real client link and wizard handshake, driven against this binary.
+voicelink = { path = "../voicelink", default-features = false }

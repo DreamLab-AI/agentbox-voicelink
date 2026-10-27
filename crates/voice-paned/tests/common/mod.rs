@@ -16,10 +16,19 @@ use voicelink_proto::{ClientMessage, PROTOCOL_VERSION, ServerMessage, decode_lin
 
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
+fn nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
 /// A private tmux server, killed on drop.
 pub struct Server {
     pub dir: tempfile::TempDir,
+    /// The server's socket path (for a named server, resolved after start).
     pub sock: PathBuf,
+    /// `tmux -L <name>` (under `TMUX_TMPDIR`) instead of `-S <path>`.
+    pub name: Option<String>,
 }
 
 impl Server {
@@ -27,6 +36,16 @@ impl Server {
     /// panes), 2 `three` (one pane), all running `cat`. Window 0 is current.
     /// `None` (with a message) when tmux is not installed.
     pub fn start() -> Option<Server> {
+        Self::start_with(false)
+    }
+
+    /// As [`Server::start`], but addressed by socket name (`-L`), the way a
+    /// controller started with `--socket-name` finds it.
+    pub fn start_named() -> Option<Server> {
+        Self::start_with(true)
+    }
+
+    fn start_with(named: bool) -> Option<Server> {
         if StdCommand::new("tmux")
             .arg("-V")
             .stdout(Stdio::null())
@@ -41,7 +60,8 @@ impl Server {
             .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
             .unwrap();
         let sock = dir.path().join("sock");
-        let s = Server { dir, sock };
+        let name = named.then(|| format!("voicelink-test-{}-{}", std::process::id(), nonce()));
+        let mut s = Server { dir, sock, name };
         s.ok(&[
             "-f",
             "/dev/null",
@@ -72,14 +92,19 @@ impl Server {
             s.out(&["display-message", "-p", "-t", "agentbox", "#{window_index}"]),
             "0"
         );
+        if s.name.is_some() {
+            s.sock = PathBuf::from(s.out(&["display-message", "-p", "#{socket_path}"]));
+        }
         Some(s)
     }
 
     pub fn cmd(&self) -> StdCommand {
         let mut c = StdCommand::new("tmux");
-        c.arg("-S")
-            .arg(&self.sock)
-            .env_remove("TMUX")
+        match &self.name {
+            Some(name) => c.arg("-L").arg(name),
+            None => c.arg("-S").arg(&self.sock),
+        };
+        c.env_remove("TMUX")
             .env_remove("TMUX_PANE")
             .env("TMUX_TMPDIR", self.dir.path());
         c
@@ -183,16 +208,7 @@ impl Server {
     }
 
     pub fn controller_with(&self, extra: &[&str]) -> Controller {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_voice-paned"))
-            .arg("--stdio")
-            .arg("--socket-path")
-            .arg(&self.sock)
-            .arg("--spool")
-            .arg(self.spool_path())
-            .args(extra)
-            .env_remove("TMUX")
-            .env_remove("TMUX_PANE")
-            .env("TMUX_TMPDIR", self.dir.path())
+        let mut child = Command::from(self.controller_command(extra))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -206,6 +222,23 @@ impl Server {
             stdin,
             stdout,
         }
+    }
+
+    /// The `voice-paned --stdio` command line for this server, not yet spawned.
+    pub fn controller_command(&self, extra: &[&str]) -> StdCommand {
+        let mut c = StdCommand::new(env!("CARGO_BIN_EXE_voice-paned"));
+        c.arg("--stdio");
+        match &self.name {
+            Some(name) => c.arg("--socket-name").arg(name),
+            None => c.arg("--socket-path").arg(&self.sock),
+        };
+        c.arg("--spool")
+            .arg(self.spool_path())
+            .args(extra)
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .env("TMUX_TMPDIR", self.dir.path());
+        c
     }
 
     /// Runs the recorder binary as an agent hook would.
@@ -237,6 +270,57 @@ impl Server {
         }
         drop(sin);
         child.wait_with_output().unwrap()
+    }
+}
+
+/// A pane whose foreground process is named like an agent CLI.
+pub struct FakeAgent {
+    pub pane: String,
+    pub tty: String,
+}
+
+impl FakeAgent {
+    /// Draws on the pane by writing to its tty (as a TUI would).
+    pub fn draw(&self, text: &str) {
+        std::fs::write(&self.tty, text).unwrap();
+    }
+}
+
+impl Server {
+    /// Adds a window `window_name` running `exec -a <command> bash -c 'read x; read x'`
+    /// (tty echo stays on, so anything typed into it shows on screen) and waits
+    /// until tmux reports `<command>` as the pane's foreground command.
+    pub fn fake_agent(&self, command: &str, window_name: &str) -> FakeAgent {
+        self.ok(&[
+            "new-window",
+            "-d",
+            "-t",
+            "agentbox:",
+            "-n",
+            window_name,
+            "bash",
+            "-c",
+            &format!("exec -a {command} bash -c 'read x; read x'"),
+        ]);
+        let target = format!("agentbox:{window_name}");
+        let pane = self.out(&["list-panes", "-t", &target, "-F", "#{pane_id}"]);
+        let tty = self.out(&["display-message", "-p", "-t", &pane, "#{pane_tty}"]);
+        let start = Instant::now();
+        while self.out(&[
+            "display-message",
+            "-p",
+            "-t",
+            &pane,
+            "#{pane_current_command}",
+        ]) != command
+        {
+            assert!(
+                start.elapsed() < TIMEOUT,
+                "pane command never became `{command}`"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        FakeAgent { pane, tty }
     }
 }
 

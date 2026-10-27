@@ -41,6 +41,19 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps -p voicelink
 
+  msrv:
+    name: MSRV (rust-version 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to the 1.88 toolchain, the workspace `rust-version`: a newer
+      # language or std feature fails here instead of for a downstream user.
+      # No ALSA headers needed: the audio backend is off.
+      - uses: dtolnay/rust-toolchain@360a4e93673de6630fac2478bc9e35244b01a759 # branch 1.88.0
+        with:
+          toolchain: 1.88.0
+      - run: cargo check --workspace --no-default-features --locked
+
   macos:
     name: build check (macOS, Apple silicon)
     runs-on: macos-14

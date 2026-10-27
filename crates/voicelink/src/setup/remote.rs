@@ -166,8 +166,16 @@ pub fn interpret_first_line(line: &str) -> Result<Welcome, String> {
 
 /// Performs Hello/Welcome over ssh, then says Bye.
 pub fn handshake(conn: &Connection) -> Result<Welcome, String> {
-    let mut child = Command::new("ssh")
-        .args(stdio_argv(conn))
+    let mut ssh = Command::new("ssh");
+    ssh.args(stdio_argv(conn));
+    handshake_with(ssh, &conn.view_session)
+}
+
+/// Performs Hello/Welcome with the controller started by `command` (whose
+/// stdin and stdout become the session), then says Bye. Production passes
+/// `ssh`; tests pass the `voice-paned` binary itself.
+pub fn handshake_with(mut command: Command, view_session: &str) -> Result<Welcome, String> {
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -178,7 +186,7 @@ pub fn handshake(conn: &Connection) -> Result<Welcome, String> {
     let hello = ClientMessage::Hello {
         proto: PROTOCOL_VERSION,
         client: format!("voicelink/{}", env!("CARGO_PKG_VERSION")),
-        view_session: conn.view_session.clone(),
+        view_session: view_session.to_string(),
     };
     let line = encode_line(&hello).map_err(|e| e.to_string())?;
     stdin
