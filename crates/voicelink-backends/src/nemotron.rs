@@ -141,8 +141,11 @@ impl SpeechToText for NemotronStt {
                 })?)
                 .await
                 .map_err(ws_err)?;
-                // ~8x real time: fast, but inside the server's bounded queue.
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                // The server's queue holds roughly 36 s of audio and overflows
+                // rather than blocks: send ~8x real time for the first 24 s,
+                // then drop to 2x so long utterances cannot outrun inference.
+                let gap = if i < 300 { 10 } else { 40 };
+                tokio::time::sleep(Duration::from_millis(gap)).await;
             }
             Ok::<_, BackendError>(())
         };

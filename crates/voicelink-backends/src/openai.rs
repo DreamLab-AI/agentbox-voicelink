@@ -164,6 +164,15 @@ fn role_str(r: Role) -> &'static str {
     }
 }
 
+/// OpenAI wants arguments as a JSON string; a raw string that failed to parse on
+/// the way in goes back out unchanged rather than double-quoted.
+fn arguments_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 fn message_json(m: &ChatMessage) -> Value {
     let mut o = Map::new();
     o.insert("role".into(), json!(role_str(m.role)));
@@ -183,7 +192,7 @@ fn message_json(m: &ChatMessage) -> Value {
                 json!({
                     "id": c.id,
                     "type": "function",
-                    "function": {"name": c.name, "arguments": c.arguments.to_string()},
+                    "function": {"name": c.name, "arguments": arguments_string(&c.arguments)},
                 })
             })
             .collect();

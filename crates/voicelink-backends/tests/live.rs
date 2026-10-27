@@ -173,3 +173,86 @@ async fn loom_chat_and_tool_call() {
             .contains("ls")
     );
 }
+
+#[cfg(feature = "kokoro")]
+#[tokio::test]
+#[ignore = "needs VOICELINK_LIVE=1, Kokoro ONNX model + voices, and estate Nemotron"]
+async fn embedded_kokoro_to_nemotron() {
+    if !live() {
+        return;
+    }
+    let dir = "/home/devuser/workspace/.tmp/vl-models";
+    let t = Instant::now();
+    let tts = build_tts(&TtsConfig::Kokoro {
+        model_path: env(
+            "VOICELINK_KOKORO_MODEL",
+            &format!("{dir}/kokoro-v1.0.int8.onnx"),
+        ),
+        voices_path: env("VOICELINK_KOKORO_VOICES", &format!("{dir}/voices-v1.0.bin")),
+        voice: "af_heart".into(),
+    })
+    .unwrap();
+    println!("kokoro load {:?}; backend {}", t.elapsed(), tts.name());
+    let (tx, mut rx) = mpsc::channel(256);
+    let t = Instant::now();
+    let task = tokio::spawn(async move { tts.synthesize(SENTENCE, tx).await });
+    let (mut first, mut samples, mut rate) = (None, Vec::new(), 0);
+    while let Some(c) = rx.recv().await {
+        first.get_or_insert_with(|| t.elapsed());
+        rate = c.sample_rate;
+        samples.extend(c.samples);
+    }
+    task.await.unwrap().unwrap();
+    println!(
+        "Kokoro: first chunk {:?}, total {:?}, {:.2}s audio @ {rate} Hz",
+        first.unwrap(),
+        t.elapsed(),
+        samples.len() as f32 / rate as f32
+    );
+    let clip = AudioClip {
+        sample_rate: rate,
+        samples,
+    };
+    let stt = build_stt(&SttConfig::Nemotron {
+        url: env(
+            "VOICELINK_NEMOTRON_URL",
+            "ws://speech-to-text:8000/api/asr-streaming",
+        ),
+    })
+    .unwrap();
+    let tr = stt.transcribe(&clip).await.unwrap();
+    assert_keywords("nemotron(kokoro)", &tr.text);
+}
+
+#[tokio::test]
+#[ignore = "needs VOICELINK_LIVE=1 and estate services"]
+async fn long_utterance_through_nemotron() {
+    if !live() {
+        return;
+    }
+    let mut all = synth().await;
+    for _ in 0..6 {
+        all.samples.extend(synth().await.samples);
+    }
+    println!(
+        "long utterance: {:.1}s of audio",
+        all.samples.len() as f32 / all.sample_rate as f32
+    );
+    let stt = build_stt(&SttConfig::Nemotron {
+        url: env(
+            "VOICELINK_NEMOTRON_URL",
+            "ws://speech-to-text:8000/api/asr-streaming",
+        ),
+    })
+    .unwrap();
+    let t = Instant::now();
+    let tr = stt.transcribe(&all).await.unwrap();
+    println!(
+        "long Nemotron latency {:?}; {} words",
+        t.elapsed(),
+        tr.text.split_whitespace().count()
+    );
+    let lower = tr.text.to_lowercase();
+    assert_eq!(lower.matches("quick").count(), 7, "{}", tr.text);
+    assert_eq!(lower.matches("river").count(), 7, "{}", tr.text);
+}

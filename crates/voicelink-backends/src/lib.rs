@@ -8,18 +8,18 @@
 //! |---|---|---|
 //! | STT | whisper.cpp (`whisper`, `whisper-vulkan`, `whisper-metal`) | OpenAI `/v1/audio/transcriptions`; Nemotron streaming WebSocket |
 //! | LLM | — (always HTTP: a model server outlives the client) | OpenAI `/v1/chat/completions` with tool calls |
-//! | TTS | — (see below) | OpenAI `/v1/audio/speech` (Kokoro-FastAPI, Pocket TTS) |
+//! | TTS | Kokoro-82M (`kokoro`) | OpenAI `/v1/audio/speech` (Kokoro-FastAPI, Pocket TTS) |
 //!
 //! ROCm and CUDA are reached through the HTTP implementations (a model server
 //! built for that runtime), so client binaries never link a vendor GPU runtime.
 //!
-//! # Embedded Kokoro is not shipped
+//! # Embedded Kokoro
 //!
-//! Kokoro-82M needs a grapheme-to-phoneme front end, and every practical Rust
-//! one links espeak-ng (GPL-3.0), which would break this crate's
-//! `Apache-2.0 OR MIT` licence. [`TtsConfig::Kokoro`] therefore stays in the
-//! config enum (so configuration files remain stable) but [`build_tts`] rejects
-//! it with [`BackendError::Config`]; run Kokoro-FastAPI and select
+//! The `kokoro` feature runs Kokoro-82M in-process through ONNX Runtime (`ort`).
+//! Phonemisation uses `misaki-rs` with its default `espeak` feature **off**:
+//! espeak-ng is GPL-3.0 and would taint the `Apache-2.0 OR MIT` licence, so
+//! words missing from the bundled dictionaries are spelled letter by letter.
+//! For full-coverage pronunciation run Kokoro-FastAPI and select
 //! [`TtsConfig::OpenAi`] instead.
 //!
 //! # Features
@@ -27,6 +27,7 @@
 //! | Feature | Effect |
 //! |---|---|
 //! | `whisper` | Embedded whisper.cpp, CPU (needs `cmake` and a C++ compiler to build) |
+//! | `kokoro` | Embedded Kokoro-82M TTS via ONNX Runtime (downloads a prebuilt ONNX Runtime at build time; needs Rust 1.92) |
 //! | `whisper-vulkan` | `whisper` plus the Vulkan GPU backend |
 //! | `whisper-metal` | `whisper` plus the Metal GPU backend |
 //!
@@ -57,6 +58,10 @@
 //! ```
 
 mod audio;
+#[cfg(feature = "kokoro")]
+mod kokoro;
+#[cfg(feature = "kokoro")]
+mod kokoro_vocab;
 mod nemotron;
 mod openai;
 #[cfg(feature = "whisper")]
@@ -331,13 +336,23 @@ pub fn build_llm(config: &LlmConfig) -> Result<Box<dyn ChatModel>> {
 ///
 /// # Errors
 ///
-/// [`BackendError::Config`] when the selected backend is not available or its
-/// settings are invalid. [`TtsConfig::Kokoro`] is always rejected: see the
-/// crate documentation.
+/// [`BackendError::Config`] when the selected backend's feature is not
+/// compiled in or its settings are invalid.
 pub fn build_tts(config: &TtsConfig) -> Result<Box<dyn TextToSpeech>> {
     match config {
+        #[cfg(feature = "kokoro")]
+        TtsConfig::Kokoro {
+            model_path,
+            voices_path,
+            voice,
+        } => Ok(Box::new(kokoro::KokoroTts::new(
+            model_path,
+            voices_path,
+            voice,
+        )?)),
+        #[cfg(not(feature = "kokoro"))]
         TtsConfig::Kokoro { .. } => Err(BackendError::Config(
-            "embedded Kokoro is not available (its phonemiser needs GPL espeak-ng); run Kokoro-FastAPI and use the `open_ai` TTS backend".into(),
+            "embedded Kokoro is not compiled in: enable the `kokoro` feature, or run Kokoro-FastAPI and use the `open_ai` TTS backend".into(),
         )),
         TtsConfig::OpenAi {
             base_url,
