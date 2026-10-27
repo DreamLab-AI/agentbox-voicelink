@@ -11,6 +11,7 @@ mod concierge;
 pub mod config;
 pub mod connect;
 pub mod daemon;
+pub mod devices_cmd;
 pub mod health;
 pub mod link;
 mod paths;

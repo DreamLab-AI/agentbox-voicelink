@@ -52,6 +52,34 @@ chooses its source independently in `voicelink setup`:
 
 Linux builds need ALSA at run time. `voicelink status` shows the daemon's state.
 
+### Choosing the microphone and speaker
+
+By default voicelink follows the system default input and output. To pin it to
+particular devices, for example the laptop's built-in microphone while a USB mic
+stays the default for everything else, list what it can see:
+
+```sh
+voicelink devices
+```
+
+and set either name under `[audio]` in `~/.config/voicelink/config.toml` (or
+pick it in `voicelink setup`, or pass `--input-device` / `--output-device` to a
+headless `voicelink setup`):
+
+```toml
+[audio]
+input_device = "Ryzen HD Audio Controller Digital Microphone"
+# output_device = "Ryzen HD Audio Controller Speaker"
+```
+
+The device is opened when the daemon starts, so reconnect after changing it. On
+Linux, voicelink talks to PulseAudio, or to PipeWire through its PulseAudio
+service, when one is running, so every PipeWire source and sink is selectable
+without taking the hardware away from other apps. A device can also be named by
+its node name (`wpctl inspect <id>` shows `node.name`; `pactl list short sources`
+prints it), which survives a description change. Without a sound server it
+falls back to plain ALSA devices.
+
 ### Build from source
 
 Needs Rust 1.88 or newer, a C toolchain (for `ring`), `pkg-config` and the ALSA

@@ -32,7 +32,7 @@ tracing-subscriber.workspace = true
 rubato = "5"
 aec3 = "0.4"
 earshot = "1"
-cpal = { version = "0.18", optional = true }
+cpal = { version = "0.18", optional = true, features = ["pulseaudio"] }
 global-hotkey = { version = "0.9", optional = true }
 ratatui = "0.30"
 ureq = { version = "3", features = ["json"] }

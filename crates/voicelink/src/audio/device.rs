@@ -44,8 +44,15 @@ fn device_name(d: &Device) -> String {
         .unwrap_or_else(|_| "unknown".into())
 }
 
+/// A configured device matches by its display name, its full cpal id
+/// (`pulseaudio:<node>`) or the bare backend id (the PipeWire or PulseAudio
+/// node name, as `wpctl inspect` or `pactl list short sources` print it).
 fn matches_name(d: &Device, wanted: &str) -> bool {
-    device_name(d) == wanted || d.id().is_ok_and(|id| id.to_string() == wanted)
+    device_name(d) == wanted || d.id().is_ok_and(|id| id_matches(&id, wanted))
+}
+
+fn id_matches(id: &cpal::DeviceId, wanted: &str) -> bool {
+    id.to_string() == wanted || id.id() == wanted
 }
 
 fn pick(host: &cpal::Host, wanted: Option<&str>, input: bool) -> anyhow::Result<Device> {
@@ -350,5 +357,17 @@ mod tests {
     fn enumeration_does_not_panic_without_sound_hardware() {
         // CI and containers may have no devices; either outcome is fine, a panic is not.
         let _ = list_devices();
+    }
+
+    #[test]
+    fn ids_match_with_or_without_the_host_prefix() {
+        let node = "alsa_input.pci-0000_c3_00.6.HiFi__Mic1__source";
+        let id = cpal::DeviceId::new(cpal::default_host().id(), node);
+        assert!(id_matches(&id, node));
+        assert!(id_matches(&id, &id.to_string()));
+        assert!(!id_matches(
+            &id,
+            "alsa_input.pci-0000_c3_00.6.HiFi__Mic2__source"
+        ));
     }
 }

@@ -3,7 +3,7 @@
 //! The binary is a thin shell over the `voicelink_client` library crate target,
 //! which exists so integration tests can drive the real link and handshake code.
 
-use voicelink_client::{connect, daemon, setup, status_cmd};
+use voicelink_client::{connect, daemon, devices_cmd, setup, status_cmd};
 
 use clap::{Parser, Subcommand};
 
@@ -37,6 +37,8 @@ enum Command {
     },
     /// Show the daemon's state.
     Status,
+    /// List the audio devices `[audio] input_device` and `output_device` accept.
+    Devices,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -47,5 +49,6 @@ fn main() -> anyhow::Result<()> {
         Command::Connect { args } => connect::run(args),
         Command::Daemon { control_path } => daemon::run(&control_path),
         Command::Status => status_cmd::run(),
+        Command::Devices => devices_cmd::run(),
     }
 }

@@ -41,7 +41,7 @@ cargo tree -p voice-paned --no-default-features -e normal,dev | grep -iE 'global
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p voicelink-proto -p tmux-control -p voicelink-backends
 ```
 
-Audio I/O (`cpal`, the `audio-io` feature, on by default) needs ALSA headers on Linux (`libasound2-dev`); CI installs them. Where they are missing, build and test the client with `--no-default-features` (which also drops the `hotkey` feature and its X11 crates).
+Audio I/O (`cpal`, the `audio-io` feature, on by default) needs ALSA headers on Linux (`libasound2-dev`); CI installs them. Where they are missing, build and test the client with `--no-default-features` (which also drops the `hotkey` feature and its X11 crates). cpal's `pulseaudio` host (a pure-Rust protocol client, no libpulse) is enabled so PipeWire/PulseAudio devices can be chosen by name; `cpal::default_host()` falls back to ALSA when no sound server runs.
 
 ## Rules
 
