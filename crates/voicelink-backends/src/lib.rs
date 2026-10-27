@@ -68,6 +68,7 @@ mod openai;
 mod whisper;
 
 pub use audio::{decode_wav, encode_wav, resample};
+pub use nemotron::NEMOTRON_MAX_UTTERANCE;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

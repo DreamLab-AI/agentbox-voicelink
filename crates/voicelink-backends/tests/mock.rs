@@ -572,3 +572,22 @@ fn factories_reject_bad_configs() {
         Err(BackendError::Config(m)) if m.contains("not compiled in")
     ));
 }
+
+#[tokio::test]
+async fn nemotron_rejects_utterance_over_limit_without_connecting() {
+    // Nothing listens on port 9: the guard must answer before any connection.
+    let stt = build_stt(&SttConfig::Nemotron {
+        url: "ws://127.0.0.1:9/api/asr-streaming".into(),
+    })
+    .unwrap();
+    let rate = 16_000;
+    let len = (voicelink_backends::NEMOTRON_MAX_UTTERANCE.as_secs() as usize + 1) * rate;
+    let clip = AudioClip {
+        sample_rate: rate as u32,
+        samples: vec![0.0; len],
+    };
+    match stt.transcribe(&clip).await {
+        Err(BackendError::Backend(m)) => assert!(m.contains("exceeds"), "{m}"),
+        other => panic!("expected the length guard, got {other:?}"),
+    }
+}

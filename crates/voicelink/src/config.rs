@@ -78,6 +78,11 @@ pub struct Audio {
     pub end_silence_ms: u32,
     /// Shortest utterance passed to STT, in milliseconds.
     pub min_utterance_ms: u32,
+    /// Longest utterance passed to STT, in milliseconds; speech beyond it is
+    /// cut into a new utterance. Keeps every clip inside the remote Nemotron
+    /// queue (about 36 s).
+    #[serde(default = "default_max_utterance_ms")]
+    pub max_utterance_ms: u32,
     /// Stop TTS playback as soon as the operator starts speaking.
     pub barge_in: bool,
 }
@@ -115,9 +120,14 @@ impl Default for Audio {
             vad_threshold: 0.5,
             end_silence_ms: 700,
             min_utterance_ms: 300,
+            max_utterance_ms: default_max_utterance_ms(),
             barge_in: true,
         }
     }
+}
+
+fn default_max_utterance_ms() -> u32 {
+    30_000
 }
 
 impl Default for Hotkey {

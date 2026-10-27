@@ -20,6 +20,10 @@ const INPUT_RATE: u32 = 24_000;
 const FRAME: usize = (INPUT_RATE as usize * 80) / 1000;
 /// Trailing silence frames (7 x 80 ms = 0.56 s) that flush the final tokens.
 const FLUSH_FRAMES: usize = 7;
+/// Longest utterance the Nemotron backend accepts. The server's audio queue
+/// holds about 36 s and overflows rather than blocks, so longer clips would
+/// lose audio silently; callers segment speech below this limit.
+pub const NEMOTRON_MAX_UTTERANCE: Duration = Duration::from_secs(30);
 /// Longest silence tolerated while awaiting the marker echo.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -93,6 +97,13 @@ fn server_error(v: &Value) -> Option<BackendError> {
 #[async_trait]
 impl SpeechToText for NemotronStt {
     async fn transcribe(&self, clip: &AudioClip) -> Result<Transcript> {
+        let seconds = clip.samples.len() as f64 / f64::from(clip.sample_rate.max(1));
+        if seconds > NEMOTRON_MAX_UTTERANCE.as_secs_f64() {
+            return Err(BackendError::Backend(format!(
+                "utterance of {seconds:.1} s exceeds the Nemotron limit of {} s",
+                NEMOTRON_MAX_UTTERANCE.as_secs()
+            )));
+        }
         let mut samples = resample(clip, INPUT_RATE).samples;
         samples.resize(samples.len().div_ceil(FRAME) * FRAME, 0.0);
         samples.resize(samples.len() + FLUSH_FRAMES * FRAME, 0.0);
