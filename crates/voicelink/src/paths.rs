@@ -23,7 +23,9 @@ pub fn config_file() -> anyhow::Result<PathBuf> {
 /// Directory for runtime state: status file, daemon log, ssh control socket.
 pub fn state_dir() -> anyhow::Result<PathBuf> {
     let d = dirs()?;
-    Ok(d.state_dir().map(PathBuf::from).unwrap_or_else(|| d.data_local_dir().join("state")))
+    Ok(d.state_dir()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| d.data_local_dir().join("state")))
 }
 
 /// The daemon status file.
