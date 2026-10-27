@@ -1,7 +1,13 @@
 //! `voicelink`: local voice for agent CLIs running in a remote tmux.
 
+mod audio;
 mod config;
+mod connect;
+mod daemon;
+mod paths;
+mod setup;
 mod status;
+mod status_cmd;
 
 use clap::{Parser, Subcommand};
 
@@ -19,7 +25,7 @@ enum Command {
     Setup,
     /// Attach this terminal to agentbox and start the voice link (the default).
     Connect,
-    /// Run the voice daemon for an established ControlMaster (started by `connect`).
+    /// Run the voice daemon over an established ssh ControlMaster (started by `connect`).
     #[command(hide = true)]
     Daemon {
         /// ssh ControlPath socket to multiplex over.
@@ -31,7 +37,10 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let _ = cli.command;
-    Ok(())
+    match Cli::parse().command.unwrap_or(Command::Connect) {
+        Command::Setup => setup::run(),
+        Command::Connect => connect::run(),
+        Command::Daemon { control_path } => daemon::run(&control_path),
+        Command::Status => status_cmd::run(),
+    }
 }

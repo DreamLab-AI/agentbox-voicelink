@@ -14,7 +14,7 @@ authors.workspace = true
 
 [dependencies]
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "sync", "rt", "macros", "time"] }
 
 [lints]
 workspace = true

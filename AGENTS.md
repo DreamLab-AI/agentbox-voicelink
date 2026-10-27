@@ -25,16 +25,18 @@ Canonical, tool-neutral rules for every coding agent working here. Agentbox side
 ## Build & test
 
 ```
-export CARGO_TARGET_DIR=/home/devuser/workspace/.tmp/voicelink-target   # in the agentbox container; keep targets out of the tree
+export CARGO_TARGET_DIR=/home/devuser/workspace/.tmp/vl-target-<worker>   # in the agentbox container: one per worktree, outside the tree
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p voicelink-proto -p tmux-control -p voicelink-backends
 ```
 
-Audio I/O (`cpal`) needs ALSA headers on Linux (`libasound2-dev`); CI installs them.
+Audio I/O (`cpal`, the `audio-io` feature, on by default) needs ALSA headers on Linux (`libasound2-dev`); CI installs them. Where they are missing, build and test the client with `--no-default-features`.
 
 ## Rules
+
+- **Never touch a live tmux server.** Every test and dev run uses a private server (`tmux -L voicelink-test-<pid>` or `-S <tmpdir>/sock`) that the test starts and kills itself. `voice-paned` and `tmux-control` take the socket as a parameter for exactly this reason. In the agentbox container the default server is the operator's: a stray `send-keys` types into a live agent prompt.
 
 - One checkout per worker: each parallel agent works in its own `git worktree`.
 - Never hand-roll cryptography; this repo should need none.

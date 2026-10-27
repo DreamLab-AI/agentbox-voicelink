@@ -24,8 +24,8 @@
 //! [`ClientMessage::Keys`], [`ClientMessage::Interrupt`]) carry **no pane
 //! argument**: they always act on the pane currently focused in the client's
 //! view session. Acting on a background pane is only possible by first
-//! changing focus with [`ClientMessage::SelectWindow`], which the operator can
-//! see. Reads ([`ClientMessage::ReadPane`], [`ClientMessage::ListPanes`]) may
+//! moving focus to it with [`ClientMessage::SelectPane`], which the operator
+//! can see. Reads ([`ClientMessage::ReadPane`], [`ClientMessage::ListPanes`]) may
 //! address any pane.
 //!
 //! # Event spool
@@ -124,12 +124,14 @@ pub enum ClientMessage {
         /// Correlation id.
         id: RequestId,
     },
-    /// Changes the view session's current window, moving focus.
-    SelectWindow {
+    /// Moves the view session's focus to a pane: selects its window, then
+    /// makes it that window's active pane. The active pane is per-window
+    /// state, so other sessions viewing the same window see the change too.
+    SelectPane {
         /// Correlation id.
         id: RequestId,
-        /// Window index (as shown in the tmux status bar).
-        window: u32,
+        /// Pane to focus (pane ids survive window renumbering).
+        pane: PaneId,
     },
     /// Liveness probe.
     Ping {
@@ -173,7 +175,7 @@ pub enum ServerMessage {
         /// Captured text, lines joined with `\n`, trailing blank lines removed.
         text: String,
     },
-    /// Success reply to a write or [`ClientMessage::SelectWindow`].
+    /// Success reply to a write or [`ClientMessage::SelectPane`].
     Ack {
         /// Correlation id.
         id: RequestId,
@@ -476,7 +478,7 @@ mod tests {
             ClientMessage::Send { id: 3, text: "fix the build\n".into(), submit: true, force: false },
             ClientMessage::Keys { id: 4, keys: vec![Key::Digit(2), Key::Enter, Key::Letter('y')] },
             ClientMessage::Interrupt { id: 5 },
-            ClientMessage::SelectWindow { id: 6, window: 3 },
+            ClientMessage::SelectPane { id: 6, pane: "%12".into() },
             ClientMessage::Ping { id: 7 },
             ClientMessage::Bye,
         ];
@@ -534,6 +536,8 @@ mod tests {
             "{\"type\":\"keys\",\"id\":9,\"keys\":[{\"key\":\"digit\",\"value\":1},{\"key\":\"enter\"}]}\n"
         );
         let focus_line = encode_line(&ServerMessage::Focus(focus())).unwrap();
+        let select = encode_line(&ClientMessage::SelectPane { id: 2, pane: "%12".into() }).unwrap();
+        assert_eq!(select, "{\"type\":\"select_pane\",\"id\":2,\"pane\":\"%12\"}\n");
         assert_eq!(
             focus_line,
             "{\"type\":\"focus\",\"window\":2,\"window_name\":\"Services\",\"pane\":\"%7\",\"command\":\"codex\",\"agent\":\"codex\"}\n"

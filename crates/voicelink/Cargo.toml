@@ -17,9 +17,16 @@ voicelink-backends.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "io-std", "process", "sync", "time", "fs", "signal"] }
 tracing.workspace = true
 clap.workspace = true
+directories = "6"
+
+[features]
+default = ["audio-io"]
+# Real audio devices through cpal (needs ALSA headers on Linux). Without it the
+# pipeline still builds and its state machine is tested on synthetic buffers.
+audio-io = []
 
 [lints]
 workspace = true

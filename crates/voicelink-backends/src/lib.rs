@@ -220,3 +220,35 @@ pub enum TtsConfig {
         api_key_env: Option<String>,
     },
 }
+
+/// Builds the speech-to-text backend selected by `config`.
+///
+/// # Errors
+///
+/// [`BackendError::Config`] when the selected backend's feature is not
+/// compiled in or its settings are invalid.
+pub fn build_stt(config: &SttConfig) -> Result<Box<dyn SpeechToText>> {
+    let _ = config;
+    Err(BackendError::Config("not built yet".into()))
+}
+
+/// Builds the chat model selected by `config`.
+///
+/// # Errors
+///
+/// [`BackendError::Config`] when the settings are invalid.
+pub fn build_llm(config: &LlmConfig) -> Result<Box<dyn ChatModel>> {
+    let _ = config;
+    Err(BackendError::Config("not built yet".into()))
+}
+
+/// Builds the text-to-speech backend selected by `config`.
+///
+/// # Errors
+///
+/// [`BackendError::Config`] when the selected backend's feature is not
+/// compiled in or its settings are invalid.
+pub fn build_tts(config: &TtsConfig) -> Result<Box<dyn TextToSpeech>> {
+    let _ = config;
+    Err(BackendError::Config("not built yet".into()))
+}
