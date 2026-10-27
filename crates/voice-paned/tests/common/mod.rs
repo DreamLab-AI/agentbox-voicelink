@@ -98,6 +98,20 @@ impl Server {
         if s.name.is_some() {
             s.sock = PathBuf::from(s.out(&["display-message", "-p", "#{socket_path}"]));
         }
+        // tmux returns before its pane children have necessarily exec'd cat.
+        // Wait for the fixture processes before observing command/focus state.
+        let start = Instant::now();
+        loop {
+            let commands = s.out(&["list-panes", "-a", "-F", "#{pane_current_command}"]);
+            if commands.lines().count() == 4 && commands.lines().all(|c| c == "cat") {
+                break;
+            }
+            assert!(
+                start.elapsed() < TIMEOUT,
+                "timed out waiting for fixture panes to run cat: {commands:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         Some(s)
     }
 
@@ -109,6 +123,8 @@ impl Server {
         };
         c.env_remove("TMUX")
             .env_remove("TMUX_PANE")
+            // Do not source the operator's shell configuration in fixture panes.
+            .env("SHELL", "/bin/sh")
             .env("TMUX_TMPDIR", self.dir.path());
         c
     }

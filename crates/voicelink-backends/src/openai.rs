@@ -318,8 +318,8 @@ pub(crate) fn parse_chat_reply(v: &Value) -> Result<ChatMessage> {
         }
     }
     // Servers often send "" beside tool calls; the contract says absent.
-    let content = content_text(msg.get("content"))
-        .filter(|c| !(!tool_calls.is_empty() && c.trim().is_empty()));
+    let content =
+        content_text(msg.get("content")).filter(|c| tool_calls.is_empty() || !c.trim().is_empty());
     Ok(ChatMessage {
         role: Role::Assistant,
         content,

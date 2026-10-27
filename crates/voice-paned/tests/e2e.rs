@@ -714,12 +714,16 @@ async fn recorder_events_flow_through_the_tail_including_rotation() {
     );
     let e = ctl.recv_until(next_event).await;
     assert_eq!(e.text.as_deref(), Some("after truncation"));
-    // The idle_prompt notice was skipped: nothing else is pending.
+    // The idle_prompt notice was skipped: no further spool events are pending.
+    // Unsolicited focus updates are independent of the recorder under test.
+    let extra = tokio::time::timeout(
+        std::time::Duration::from_millis(600),
+        ctl.recv_until(next_event),
+    )
+    .await;
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(600), ctl.try_recv())
-            .await
-            .is_err(),
-        "no further events expected"
+        extra.is_err(),
+        "no further spool events expected, got {extra:?}"
     );
 }
 
