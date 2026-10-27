@@ -55,9 +55,12 @@ impl Server {
             eprintln!("SKIP: tmux not found on PATH");
             return None;
         }
+        // The system temp dir, not CARGO_TARGET_TMPDIR: tmux sockets live
+        // under TMUX_TMPDIR and a Unix socket path is capped at 108 bytes,
+        // which a deep CI checkout path overruns.
         let dir = tempfile::Builder::new()
             .prefix("vp-")
-            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .tempdir_in(std::env::temp_dir())
             .unwrap();
         let sock = dir.path().join("sock");
         let name = named.then(|| format!("voicelink-test-{}-{}", std::process::id(), nonce()));
