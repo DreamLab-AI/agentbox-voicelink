@@ -5,16 +5,16 @@
 //! * The view session is a *grouped* session of the base session: same
 //!   windows, independent current window. Killing or detaching it never closes
 //!   the shared windows.
-//! * `destroy-unattached` is armed over the control connection **after**
-//!   attaching. Setting it from a one-shot command on a session with no client
-//!   destroys the session at once, so a launcher must likewise set it only
-//!   after its terminal client has attached (or not at all).
-//! * While any client is attached (terminal or control) the session lives.
-//!   When the terminal detaches and the control client remains, the session
-//!   survives; when the last client leaves, it is destroyed. So a controller
-//!   exiting with no terminal attached takes the (empty) view session with it,
-//!   and one exiting while the operator's terminal is attached leaves it alone.
-//!   The controller never runs `kill-session` itself.
+//! * The controller never sets `destroy-unattached`. tmux destroys a session
+//!   the moment that option is set on it while no client is attached, so the
+//!   launcher sets it in the same invocation as its own attach
+//!   (`tmux attach -t =V \; set-option -t =V: destroy-unattached on`). Once the
+//!   launcher has armed it, a session survives while any client (terminal or
+//!   control) is attached, including when the terminal detaches and the
+//!   control client remains; it is destroyed when the last client leaves.
+//!   Without the option (a session the controller created itself) it simply
+//!   persists after the controller exits.
+//! * The controller never runs `kill-session`.
 //! * The control client uses `ignore-size,no-output`: it neither resizes the
 //!   operator's windows (even if it declared a size) nor receives pane output.
 //!   The controller never sends `refresh-client -C`.
@@ -362,12 +362,8 @@ where
     code
 }
 
-/// Ensures the grouped view session, attaches the control client, and arms
-/// `destroy-unattached`.
-///
-/// Order matters: tmux destroys an unattached session the moment the option
-/// is set on it (verified on 3.8), so the option is set over the control
-/// connection *after* attaching, never from a one-shot command before.
+/// Ensures the grouped view session and attaches the control client. Does not
+/// touch `destroy-unattached` (see the module documentation).
 async fn attach(config: &Config, view: &str) -> Result<(Tmux, Notifications), String> {
     let options = ClientOptions::new(view)
         .flag("ignore-size")
@@ -388,15 +384,6 @@ async fn attach(config: &Config, view: &str) -> Result<(Tmux, Notifications), St
                     client,
                     view: view.to_owned(),
                 };
-                tmux.cmd([
-                    "set-option",
-                    "-t",
-                    &tmux.view_target(),
-                    "destroy-unattached",
-                    "on",
-                ])
-                .await
-                .map_err(|e| e.to_string())?;
                 return Ok((tmux, notes));
             }
             // The launcher may have created and lost the session in the

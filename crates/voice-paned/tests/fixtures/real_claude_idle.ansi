@@ -1,38 +1,3 @@
-
-[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.306[39m
-[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mOpus 5.5 · Claude Max[39m
-[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/home/devuser/workspace/.tmp/cap/work[39m
-
-
-[38;5;246m●[39m [38;5;246mruflo-mods: ruflo mod trust: ruflo-swarm (ruflo-swarm@agentbox) loaded; fs.write (writes files [39m
-  [38;5;246m(settings, hooks, helpers included)); process.run (runs host commands); on agent.spawn (can rewrite [39m
-  [38;5;246mor answer every agent spawn); on tool.call (can rewrite or answer tool calls); on * (sees every [39m
-  [38;5;246mevent)[39m
-
-[38;5;246m●[39m [38;5;246mruflo-mods: ruflo mod trust: jev-checkpoints (jev-checkpoints@agentbox) loaded; fs.write (writes [39m
-  [38;5;246mfiles (settings, hooks, helpers included)); http.fetch (makes network requests); on tool.call (can [39m
-  [38;5;246mrewrite or answer tool calls); on prompt.submit (can add to or rewrite every prompt you send); on [39m
-  [38;5;246magent.spawn (can rewrite or answer every agent spawn)[39m
-
-[38;5;246m●[39m [38;5;246mruflo-mods: ruflo mod trust: factrail (factrail@agentbox) loaded; process.run (runs host commands); [39m
-  [38;5;246mon tool.call (can rewrite or answer tool calls)[39m
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                                                                                          [38;5;246m◐ medium · /effort[39m
 [38;5;244m──────────────────────────────────────────────────────────────────────────────────────────────────────────────
 [39m❯ [2mTry "create a util logging.py that..."[0m
 [38;5;244m──────────────────────────────────────────────────────────────────────────────────────────────────────────────

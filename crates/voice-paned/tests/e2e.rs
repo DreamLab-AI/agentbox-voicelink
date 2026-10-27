@@ -851,7 +851,7 @@ async fn clean_exit_leaves_the_shared_windows_alone() {
         "-F",
         "#{window_id} #{window_name}",
     ]);
-    let panes_before = srv.out(&["list-panes", "-a", "-F", "#{pane_id}"]);
+    let panes_before = srv.out(&["list-panes", "-s", "-t", "=agentbox:", "-F", "#{pane_id}"]);
 
     // EOF.
     let mut ctl = srv.controller();
@@ -891,7 +891,7 @@ async fn clean_exit_leaves_the_shared_windows_alone() {
         windows_before
     );
     assert_eq!(
-        srv.out(&["list-panes", "-a", "-F", "#{pane_id}"]),
+        srv.out(&["list-panes", "-s", "-t", "=agentbox:", "-F", "#{pane_id}"]),
         panes_before
     );
     assert_eq!(srv.base_window(), "0");
@@ -967,4 +967,85 @@ async fn prompt_detection_emits_once_per_menu_and_rearms() {
     draw(menu);
     let e = ctl.recv_until(next_event).await;
     assert_eq!(e.kind, EventKind::Prompt);
+}
+
+#[tokio::test]
+async fn controller_never_arms_destroy_unattached_and_launcher_can() {
+    let srv = server!();
+    let mut ctl = srv.controller();
+    ctl.handshake("lv").await;
+    assert_eq!(
+        srv.out(&["show-options", "-Av", "-t", "=lv:", "destroy-unattached"]),
+        "off"
+    );
+
+    // The launcher attaches its terminal and arms the option once attached.
+    let Some(pty) = common::PtyClient::attach(&srv, "=lv", 80, 24) else {
+        return;
+    };
+    srv.ok(&["set-option", "-t", "=lv:", "destroy-unattached", "on"]);
+
+    // Terminal detaches while the controller's control client remains: the
+    // view survives and the controller keeps working.
+    let name = srv.terminal_clients().remove(0);
+    srv.ok(&["detach-client", "-t", &name]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(srv.sessions().contains(&"lv".to_owned()));
+    assert_eq!(ctl.request(C::Ping { id: 1 }, 1).await, S::Pong { id: 1 });
+
+    // The controller exits last: tmux (not the controller) destroys the view.
+    assert!(ctl.close_and_wait().await.success());
+    let start = std::time::Instant::now();
+    while srv.sessions().contains(&"lv".to_owned()) {
+        assert!(
+            start.elapsed() < TIMEOUT,
+            "armed view should go with its last client"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(srv.base_window(), "0");
+    drop(pty);
+
+    // Unarmed: a controller-created view simply persists after exit.
+    let mut ctl = srv.controller();
+    ctl.handshake("persist").await;
+    assert!(ctl.close_and_wait().await.success());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(srv.sessions().contains(&"persist".to_owned()));
+}
+
+#[tokio::test]
+async fn recorder_rotates_an_oversized_spool_itself() {
+    let srv = server!();
+    let spool = srv.spool_path();
+    std::fs::create_dir_all(spool.parent().unwrap()).unwrap();
+    let filler = "{\"v\":1,\"ts_ms\":1,\"pane\":\"%0\",\"window\":0,\"agent\":\"codex\",\"kind\":\"notice\",\"text\":\"filler\"}\n";
+    std::fs::write(
+        &spool,
+        filler.repeat(voicelink_proto::SPOOL_MAX_BYTES as usize / filler.len() + 2),
+    )
+    .unwrap();
+    let mut ctl = srv.controller();
+    ctl.handshake("rot").await;
+    let pane = srv.panes_of(0)[0].clone();
+    let payload = r#"{"type":"agent-turn-complete","last-assistant-message":"post rotation"}"#;
+    let out = srv.record(
+        &[
+            "--source",
+            "codex",
+            "--spool",
+            spool.to_str().unwrap(),
+            payload,
+        ],
+        None,
+        Some(&pane),
+    );
+    assert!(out.status.success() && out.stdout.is_empty());
+    assert!(
+        spool.with_file_name("events.jsonl.1").exists(),
+        "the recorder must rotate"
+    );
+    assert!(std::fs::metadata(&spool).unwrap().len() < 1000);
+    let e = ctl.recv_until(next_event).await;
+    assert_eq!(e.text.as_deref(), Some("post rotation"));
 }

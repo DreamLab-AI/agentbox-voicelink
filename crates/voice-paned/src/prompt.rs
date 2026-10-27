@@ -64,10 +64,31 @@ pub fn detect(agent: AgentKind, screen: &str) -> Option<String> {
     if agent == AgentKind::Other {
         return None;
     }
-    let all: Vec<&str> = screen.lines().collect();
+    // capture-pane returns the full pane height; ignore the blank rows below.
+    let mut all: Vec<&str> = screen.lines().collect();
+    while all.last().is_some_and(|l| l.trim().is_empty()) {
+        all.pop();
+    }
     let tail = &all[all.len().saturating_sub(SCAN_LINES)..];
     let lines: Vec<String> = tail.iter().map(|l| normalise(l)).collect();
-    cursor_menu(agent, &lines).or_else(|| phrase_prompt(agent, &lines))
+    let cursors = CURSORS.iter().find(|(a, _)| *a == agent)?.1;
+    let (text, end) = cursor_menu(agent, &lines).or_else(|| phrase_prompt(agent, &lines))?;
+    // The agents hide the composer while a menu is up. A composer below the
+    // match means it is transcript text (a past message, tool output).
+    if lines[end + 1..].iter().any(|l| is_composer(l, cursors)) {
+        return None;
+    }
+    Some(text)
+}
+
+/// A cursor glyph followed by free text or nothing, but not a numbered option.
+fn is_composer(line: &str, cursors: &[char]) -> bool {
+    let Some(c) = line.chars().next().filter(|c| cursors.contains(c)) else {
+        return false;
+    };
+    let rest = &line[c.len_utf8()..];
+    (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        && parse_option(line, cursors).is_none()
 }
 
 /// Strips box-drawing borders and surrounding whitespace.
@@ -128,7 +149,7 @@ fn parse_option(line: &str, cursors: &[char]) -> Option<Opt> {
 /// shows one under each label).
 const MAX_DESCRIPTION_LINES: usize = 3;
 
-fn cursor_menu(agent: AgentKind, lines: &[String]) -> Option<String> {
+fn cursor_menu(agent: AgentKind, lines: &[String]) -> Option<(String, usize)> {
     let cursors = CURSORS.iter().find(|(a, _)| *a == agent)?.1;
     let parsed: Vec<Option<Opt>> = lines.iter().map(|l| parse_option(l, cursors)).collect();
     // The last line carrying the cursor on a numbered option.
@@ -201,7 +222,7 @@ fn cursor_menu(agent: AgentKind, lines: &[String]) -> Option<String> {
         let o = parsed[i].as_ref()?;
         out.push(format!("{}. {}", o.number, o.label));
     }
-    Some(out.join("\n"))
+    Some((out.join("\n"), *options.last()?))
 }
 
 fn is_phrase(agent: AgentKind, line: &str) -> bool {
@@ -211,7 +232,7 @@ fn is_phrase(agent: AgentKind, line: &str) -> bool {
         .any(|(a, p)| *a == agent && lower.contains(p))
 }
 
-fn phrase_prompt(agent: AgentKind, lines: &[String]) -> Option<String> {
+fn phrase_prompt(agent: AgentKind, lines: &[String]) -> Option<(String, usize)> {
     let last = lines.iter().rposition(|l| {
         is_phrase(agent, l)
             || YES_NO_SUFFIXES
@@ -228,15 +249,17 @@ fn phrase_prompt(agent: AgentKind, lines: &[String]) -> Option<String> {
         .filter(|l| !l.is_empty())
         .map(String::as_str)
         .collect();
-    for l in lines[last + 1..].iter().take(8) {
+    let mut end = last;
+    for (i, l) in lines.iter().enumerate().skip(last + 1).take(8) {
         if is_rule(l) || is_footer(l) {
             break;
         }
         if !l.is_empty() {
             out.push(l);
+            end = i;
         }
     }
-    Some(out.join("\n"))
+    Some((out.join("\n"), end))
 }
 
 #[cfg(test)]
@@ -275,6 +298,9 @@ mod tests {
         ),
         ("claude_idle.txt", AgentKind::Claude, None),
         ("claude_working.txt", AgentKind::Claude, None),
+        ("claude_transcript_numbered.txt", AgentKind::Claude, None),
+        ("codex_transcript_numbered.txt", AgentKind::Codex, None),
+        ("claude_transcript_yn.txt", AgentKind::Claude, None),
         ("real_claude_idle.txt", AgentKind::Claude, None),
         ("real_claude_typed.txt", AgentKind::Claude, None),
         ("real_codex_idle.txt", AgentKind::Codex, None),

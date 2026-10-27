@@ -1,0 +1,8 @@
+› 1. refactor the parser
+  2. add tests for it
+
+• Done. Both are finished.
+
+› Ask Codex to do anything
+
+  GPT-6-Astra medium · ~/proj

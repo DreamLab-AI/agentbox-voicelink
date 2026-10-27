@@ -25,7 +25,8 @@ section of tmux(1):
 ```rust,no_run
 use tmux_control::{command_line, Client, ClientOptions, Socket};
 
-# async fn demo() -> Result<(), tmux_control::Error> {
+#[tokio::main]
+async fn main() -> Result<(), tmux_control::Error> {
 let (client, mut events) = Client::attach(
     &Socket::Name("work".into()),
     &ClientOptions::new("main").flag("ignore-size").flag("no-output"),
@@ -36,7 +37,8 @@ while let Some(event) = events.recv().await {
     println!("{event:?}");
 }
 client.detach().await;
-# Ok(()) }
+Ok(())
+}
 ```
 
 ## Notes

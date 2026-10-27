@@ -414,3 +414,50 @@ async fn run_returns_stdout_or_stderr() {
         "{err:?}"
     );
 }
+
+#[tokio::test]
+async fn compound_commands_and_hooks_do_not_misalign_replies() {
+    let Some(srv) = Server::start("base") else {
+        return;
+    };
+    srv.out(&["new-window", "-d", "-t", "base", "cat"]);
+    let (client, _rx) =
+        Client::attach(&srv.socket(), &ClientOptions::new("base").flag("no-output")).unwrap();
+    client
+        .command("set-hook -g after-select-window 'display-message -p hooked'")
+        .await
+        .unwrap();
+
+    // Hook output must not be mistaken for the reply to the next command.
+    client.command("select-window -t base:1").await.unwrap();
+    assert_eq!(
+        client.command("display-message -p sync").await.unwrap(),
+        ["sync"]
+    );
+    client.command("select-window -t base:0").await.unwrap();
+    assert_eq!(
+        client.command("display-message -p sync2").await.unwrap(),
+        ["sync2"]
+    );
+
+    // A `;` list is refused rather than allowed to shift later replies.
+    let r = client
+        .command("display-message -p a ; display-message -p b")
+        .await;
+    println!("compound: {r:?}");
+    assert_eq!(client.command("display-message -p c").await.unwrap(), ["c"]);
+    let r = client.command("if-shell -F 1 'display-message -p x'").await;
+    println!("if-shell: {r:?}");
+    assert_eq!(client.command("display-message -p d").await.unwrap(), ["d"]);
+}
+
+#[tokio::test]
+async fn escape_format_survives_format_expansion() {
+    let Some(srv) = Server::start("base") else {
+        return;
+    };
+    let (client, _rx) = Client::attach(&srv.socket(), &ClientOptions::new("base")).unwrap();
+    let raw = "#{session_name} #(echo hi) ##";
+    let line = command_line(["display-message", "-p", &tmux_control::escape_format(raw)]);
+    assert_eq!(client.command(line).await.unwrap(), [raw]);
+}

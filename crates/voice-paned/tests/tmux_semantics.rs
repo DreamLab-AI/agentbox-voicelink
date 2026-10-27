@@ -3,7 +3,7 @@
 //!
 //! * destroying a grouped view session never closes the shared windows;
 //! * `destroy-unattached` set on a session that has no client destroys it
-//!   straight away, so the controller sets it only after attaching;
+//!   straight away, so the controller never sets it (the launcher arms it in the same invocation as its attach);
 //! * while a control client is attached the session survives, and what
 //!   happens when the terminal client detaches while the control client
 //!   remains (the session survives; when the control client then leaves, it
@@ -92,7 +92,7 @@ async fn destroying_a_view_session_never_closes_shared_windows() {
 }
 
 #[tokio::test]
-async fn destroy_unattached_must_be_set_after_attaching() {
+async fn destroy_unattached_must_not_be_set_on_an_unattached_session() {
     let srv = server!();
 
     // Observed on 3.8: setting it on a session with no clients destroys the
@@ -106,8 +106,7 @@ async fn destroy_unattached_must_be_set_after_attaching() {
     });
     assert!(srv.sessions().contains(&"agentbox".to_owned()));
 
-    // The controller's order: create, attach the control client, then set it
-    // over that connection.
+    // Launcher-style arming: only once a client is attached.
     srv.ok(&["new-session", "-d", "-t", "agentbox", "-s", "late"]);
     let client = attach(&srv, "late", &["ignore-size", "no-output"]).await;
     client
