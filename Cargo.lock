@@ -955,6 +955,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs4"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3406,6 +3416,7 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 name = "tmux-control"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
 ]
@@ -3832,7 +3843,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "fs4",
  "serde_json",
+ "tempfile",
  "tmux-control",
  "tokio",
  "voicelink-proto",
