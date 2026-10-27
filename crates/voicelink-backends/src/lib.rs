@@ -8,10 +8,61 @@
 //! |---|---|---|
 //! | STT | whisper.cpp (`whisper`, `whisper-vulkan`, `whisper-metal`) | OpenAI `/v1/audio/transcriptions`; Nemotron streaming WebSocket |
 //! | LLM | — (always HTTP: a model server outlives the client) | OpenAI `/v1/chat/completions` with tool calls |
-//! | TTS | Kokoro-82M (`kokoro`) | OpenAI `/v1/audio/speech` (Kokoro-FastAPI, Pocket TTS) |
+//! | TTS | — (see below) | OpenAI `/v1/audio/speech` (Kokoro-FastAPI, Pocket TTS) |
 //!
 //! ROCm and CUDA are reached through the HTTP implementations (a model server
 //! built for that runtime), so client binaries never link a vendor GPU runtime.
+//!
+//! # Embedded Kokoro is not shipped
+//!
+//! Kokoro-82M needs a grapheme-to-phoneme front end, and every practical Rust
+//! one links espeak-ng (GPL-3.0), which would break this crate's
+//! `Apache-2.0 OR MIT` licence. [`TtsConfig::Kokoro`] therefore stays in the
+//! config enum (so configuration files remain stable) but [`build_tts`] rejects
+//! it with [`BackendError::Config`]; run Kokoro-FastAPI and select
+//! [`TtsConfig::OpenAi`] instead.
+//!
+//! # Features
+//!
+//! | Feature | Effect |
+//! |---|---|
+//! | `whisper` | Embedded whisper.cpp, CPU (needs `cmake` and a C++ compiler to build) |
+//! | `whisper-vulkan` | `whisper` plus the Vulkan GPU backend |
+//! | `whisper-metal` | `whisper` plus the Metal GPU backend |
+//!
+//! # Example
+//!
+//! ```
+//! use voicelink_backends::{build_llm, build_stt, LlmConfig, SttConfig};
+//!
+//! // Servers are contacted lazily, so building never touches the network.
+//! let llm = build_llm(&LlmConfig::OpenAi {
+//!     base_url: "http://127.0.0.1:8080/v1".into(),
+//!     model: "local".into(),
+//!     api_key_env: None,
+//!     extra: serde_json::Map::new(),
+//! })
+//! .unwrap();
+//! assert_eq!(llm.name(), "openai-chat:local");
+//!
+//! // An embedded backend whose feature is not compiled in is a clear error.
+//! # #[cfg(not(feature = "whisper"))]
+//! assert!(build_stt(&SttConfig::Whisper {
+//!     model_path: "ggml-base.en.bin".into(),
+//!     language: Some("en".into()),
+//!     threads: 4,
+//!     gpu: false,
+//! })
+//! .is_err());
+//! ```
+
+mod audio;
+mod nemotron;
+mod openai;
+#[cfg(feature = "whisper")]
+mod whisper;
+
+pub use audio::{decode_wav, encode_wav, resample};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -228,8 +279,31 @@ pub enum TtsConfig {
 /// [`BackendError::Config`] when the selected backend's feature is not
 /// compiled in or its settings are invalid.
 pub fn build_stt(config: &SttConfig) -> Result<Box<dyn SpeechToText>> {
-    let _ = config;
-    Err(BackendError::Config("not built yet".into()))
+    match config {
+        #[cfg(feature = "whisper")]
+        SttConfig::Whisper {
+            model_path,
+            language,
+            threads,
+            gpu,
+        } => Ok(Box::new(whisper::WhisperStt::new(
+            model_path, language, *threads, *gpu,
+        )?)),
+        #[cfg(not(feature = "whisper"))]
+        SttConfig::Whisper { .. } => Err(BackendError::Config(
+            "embedded whisper.cpp is not compiled in: enable the `whisper`, `whisper-vulkan` or `whisper-metal` feature".into(),
+        )),
+        SttConfig::OpenAi {
+            base_url,
+            model,
+            api_key_env,
+        } => Ok(Box::new(openai::OpenAiStt::new(
+            base_url,
+            model,
+            api_key_env,
+        )?)),
+        SttConfig::Nemotron { url } => Ok(Box::new(nemotron::NemotronStt::new(url)?)),
+    }
 }
 
 /// Builds the chat model selected by `config`.
@@ -238,17 +312,43 @@ pub fn build_stt(config: &SttConfig) -> Result<Box<dyn SpeechToText>> {
 ///
 /// [`BackendError::Config`] when the settings are invalid.
 pub fn build_llm(config: &LlmConfig) -> Result<Box<dyn ChatModel>> {
-    let _ = config;
-    Err(BackendError::Config("not built yet".into()))
+    match config {
+        LlmConfig::OpenAi {
+            base_url,
+            model,
+            api_key_env,
+            extra,
+        } => Ok(Box::new(openai::OpenAiChat::new(
+            base_url,
+            model,
+            api_key_env,
+            extra,
+        )?)),
+    }
 }
 
 /// Builds the text-to-speech backend selected by `config`.
 ///
 /// # Errors
 ///
-/// [`BackendError::Config`] when the selected backend's feature is not
-/// compiled in or its settings are invalid.
+/// [`BackendError::Config`] when the selected backend is not available or its
+/// settings are invalid. [`TtsConfig::Kokoro`] is always rejected: see the
+/// crate documentation.
 pub fn build_tts(config: &TtsConfig) -> Result<Box<dyn TextToSpeech>> {
-    let _ = config;
-    Err(BackendError::Config("not built yet".into()))
+    match config {
+        TtsConfig::Kokoro { .. } => Err(BackendError::Config(
+            "embedded Kokoro is not available (its phonemiser needs GPL espeak-ng); run Kokoro-FastAPI and use the `open_ai` TTS backend".into(),
+        )),
+        TtsConfig::OpenAi {
+            base_url,
+            model,
+            voice,
+            api_key_env,
+        } => Ok(Box::new(openai::OpenAiTts::new(
+            base_url,
+            model,
+            voice,
+            api_key_env,
+        )?)),
+    }
 }

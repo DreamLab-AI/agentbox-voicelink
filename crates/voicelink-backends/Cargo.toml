@@ -14,13 +14,32 @@ authors.workspace = true
 
 [features]
 default = []
+# Embedded whisper.cpp speech-to-text (CPU).
+whisper = ["dep:whisper-rs"]
+# Embedded whisper.cpp with the Vulkan GPU backend.
+whisper-vulkan = ["whisper", "whisper-rs/vulkan"]
+# Embedded whisper.cpp with the Metal GPU backend.
+whisper-metal = ["whisper", "whisper-rs/metal"]
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+bytes = "1"
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+rmp-serde = "1"
+rubato = "0.16"
+whisper-rs = { version = "0.16", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+serde_json.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "multipart", "ws"] }
 
 [lints]
 workspace = true
