@@ -73,6 +73,32 @@ fn authed(rb: reqwest::RequestBuilder, key: &Option<String>) -> reqwest::Request
     }
 }
 
+/// Reachability check shared by every OpenAI-style slot: `GET {base}/models`.
+///
+/// Any HTTP answer proves the server is up, except credential rejection and
+/// 5xx. 404 and 405 count as up because several speech servers (whisper.cpp's
+/// `whisper-server`, Pocket TTS) have no model listing.
+pub(crate) async fn probe_models(base_url: &str, api_key_env: &Option<String>) -> Result<()> {
+    let url = format!("{}/models", base(base_url)?);
+    let key = bearer(api_key_env)?;
+    let client = http_client(Some(crate::PROBE_TIMEOUT))?;
+    let resp = authed(client.get(&url), &key).send().await.map_err(|e| {
+        let why = if e.is_connect() {
+            "connection refused or host unreachable"
+        } else if e.is_timeout() {
+            "timed out"
+        } else {
+            "request failed"
+        };
+        BackendError::Transport(format!("{url}: {why} ({e})"))
+    })?;
+    let status = resp.status();
+    if status.is_success() || matches!(status.as_u16(), 404 | 405) {
+        return Ok(());
+    }
+    Err(BackendError::Backend(format!("{url}: HTTP {status}")))
+}
+
 // ---------------------------------------------------------------- STT
 
 pub(crate) struct OpenAiStt {
@@ -431,9 +457,10 @@ impl TextToSpeech for OpenAiTts {
                 }
             }
             let rest: Vec<u8> = it.collect();
-            let (pairs, remainder) = rest.as_chunks::<2>();
+            let pairs = rest.chunks_exact(2);
+            let remainder = pairs.remainder();
             for p in pairs {
-                pending.push(i16::from_le_bytes(*p) as f32 / 32768.0);
+                pending.push(i16::from_le_bytes([p[0], p[1]]) as f32 / 32768.0);
             }
             if let [b] = remainder {
                 carry = Some(*b);

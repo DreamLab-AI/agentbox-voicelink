@@ -1,35 +1,25 @@
-//! Interchangeable speech-to-text, chat-model and text-to-speech backends.
+//! Interchangeable speech-to-text, chat-model and text-to-speech backends,
+//! all reached over the network.
 //!
 //! Each capability is a trait ([`SpeechToText`], [`ChatModel`],
 //! [`TextToSpeech`]) with implementations chosen at runtime from a serde
 //! config enum ([`SttConfig`], [`LlmConfig`], [`TtsConfig`]):
 //!
-//! | Slot | Embedded (cargo feature) | Local or remote HTTP |
-//! |---|---|---|
-//! | STT | whisper.cpp (`whisper`, `whisper-vulkan`, `whisper-metal`) | OpenAI `/v1/audio/transcriptions`; Nemotron streaming WebSocket |
-//! | LLM | — (always HTTP: a model server outlives the client) | OpenAI `/v1/chat/completions` with tool calls |
-//! | TTS | Kokoro-82M (`kokoro`) | OpenAI `/v1/audio/speech` (Kokoro-FastAPI, Pocket TTS) |
-//!
-//! ROCm and CUDA are reached through the HTTP implementations (a model server
-//! built for that runtime), so client binaries never link a vendor GPU runtime.
-//!
-//! # Embedded Kokoro
-//!
-//! The `kokoro` feature runs Kokoro-82M in-process through ONNX Runtime (`ort`).
-//! Phonemisation uses `misaki-rs` with its default `espeak` feature **off**:
-//! espeak-ng is GPL-3.0 and would taint the `Apache-2.0 OR MIT` licence, so
-//! words missing from the bundled dictionaries are spelled letter by letter.
-//! For full-coverage pronunciation run Kokoro-FastAPI and select
-//! [`TtsConfig::OpenAi`] instead.
-//!
-//! # Features
-//!
-//! | Feature | Effect |
+//! | Slot | Backends |
 //! |---|---|
-//! | `whisper` | Embedded whisper.cpp, CPU (needs `cmake` and a C++ compiler to build) |
-//! | `kokoro` | Embedded Kokoro-82M TTS via ONNX Runtime (downloads a prebuilt ONNX Runtime at build time; needs Rust 1.92) |
-//! | `whisper-vulkan` | `whisper` plus the Vulkan GPU backend |
-//! | `whisper-metal` | `whisper` plus the Metal GPU backend |
+//! | STT | OpenAI `/v1/audio/transcriptions` (whisper.cpp `whisper-server`, speaches, OpenAI); Nemotron streaming WebSocket |
+//! | LLM | OpenAI `/v1/chat/completions` with tool calls (llama-server, Ollama, LM Studio, gateways) |
+//! | TTS | OpenAI `/v1/audio/speech` (Kokoro-FastAPI, Pocket TTS) |
+//!
+//! There are no embedded inference engines: a model server outlives the
+//! client, and GPU runtimes (ROCm, CUDA, Vulkan, Metal) belong to that server
+//! rather than to a client binary.
+//!
+//! # Health checks
+//!
+//! [`probe_stt`], [`probe_llm`] and [`probe_tts`] make one cheap, bounded
+//! (about three seconds) reachability check and name the URL in every error,
+//! so a launcher can say exactly which endpoint is down before it starts.
 //!
 //! # Example
 //!
@@ -46,36 +36,19 @@
 //! .unwrap();
 //! assert_eq!(llm.name(), "openai-chat:local");
 //!
-//! // An embedded backend whose feature is not compiled in is a clear error.
-//! # #[cfg(not(feature = "whisper"))]
-//! assert!(build_stt(&SttConfig::Whisper {
-//!     model_path: "ggml-base.en.bin".into(),
-//!     language: Some("en".into()),
-//!     threads: 4,
-//!     gpu: false,
-//! })
-//! .is_err());
+//! // A malformed endpoint is a configuration error, not a network one.
+//! assert!(build_stt(&SttConfig::Nemotron { url: "http://not-a-websocket".into() }).is_err());
 //! ```
 
 mod audio;
-#[cfg(feature = "kokoro")]
-mod kokoro;
-#[cfg(feature = "kokoro")]
-mod kokoro_vocab;
 mod nemotron;
 mod openai;
-#[cfg(feature = "whisper")]
-mod whisper;
 
 pub use audio::{decode_wav, encode_wav, resample};
 pub use nemotron::NEMOTRON_MAX_UTTERANCE;
 
-/// Whether embedded whisper.cpp ([`SttConfig::Whisper`]) is compiled in
-/// (any of the `whisper`, `whisper-vulkan` or `whisper-metal` features).
-pub const EMBEDDED_WHISPER: bool = cfg!(feature = "whisper");
-
-/// Whether embedded Kokoro ([`TtsConfig::Kokoro`]) is compiled in (the `kokoro` feature).
-pub const EMBEDDED_KOKORO: bool = cfg!(feature = "kokoro");
+/// Longest a [`probe_stt`], [`probe_llm`] or [`probe_tts`] call waits.
+pub const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -100,13 +73,13 @@ pub struct Transcript {
 /// Errors from any backend.
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
-    /// The backend is misconfigured (missing model file, bad URL, feature not compiled in).
+    /// The backend is misconfigured (bad URL, unset API-key variable).
     #[error("configuration: {0}")]
     Config(String),
     /// Transport failure talking to a server.
     #[error("transport: {0}")]
     Transport(String),
-    /// The server or engine answered with an error or an unparseable reply.
+    /// The server answered with an error or an unparseable reply.
     #[error("backend: {0}")]
     Backend(String),
     /// The operation was cancelled (receiver dropped).
@@ -214,17 +187,6 @@ pub struct ChatRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SttConfig {
-    /// whisper.cpp in-process (needs a `whisper*` feature).
-    Whisper {
-        /// Path to a ggml model file.
-        model_path: String,
-        /// Language code, or `None` to auto-detect.
-        language: Option<String>,
-        /// CPU threads.
-        threads: u16,
-        /// Use the GPU backend compiled in (Vulkan or Metal).
-        gpu: bool,
-    },
     /// OpenAI-compatible `/v1/audio/transcriptions`.
     OpenAi {
         /// Base URL up to and including `/v1`.
@@ -263,15 +225,6 @@ pub enum LlmConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TtsConfig {
-    /// Kokoro-82M in-process (needs the `kokoro` feature).
-    Kokoro {
-        /// Path to the Kokoro ONNX model.
-        model_path: String,
-        /// Path to the voices file.
-        voices_path: String,
-        /// Voice name.
-        voice: String,
-    },
     /// OpenAI-compatible `/v1/audio/speech` (Kokoro-FastAPI, Pocket TTS).
     OpenAi {
         /// Base URL up to and including `/v1`.
@@ -289,23 +242,9 @@ pub enum TtsConfig {
 ///
 /// # Errors
 ///
-/// [`BackendError::Config`] when the selected backend's feature is not
-/// compiled in or its settings are invalid.
+/// [`BackendError::Config`] when the settings are invalid.
 pub fn build_stt(config: &SttConfig) -> Result<Box<dyn SpeechToText>> {
     match config {
-        #[cfg(feature = "whisper")]
-        SttConfig::Whisper {
-            model_path,
-            language,
-            threads,
-            gpu,
-        } => Ok(Box::new(whisper::WhisperStt::new(
-            model_path, language, *threads, *gpu,
-        )?)),
-        #[cfg(not(feature = "whisper"))]
-        SttConfig::Whisper { .. } => Err(BackendError::Config(
-            "embedded whisper.cpp is not compiled in: enable the `whisper`, `whisper-vulkan` or `whisper-metal` feature".into(),
-        )),
         SttConfig::OpenAi {
             base_url,
             model,
@@ -344,24 +283,9 @@ pub fn build_llm(config: &LlmConfig) -> Result<Box<dyn ChatModel>> {
 ///
 /// # Errors
 ///
-/// [`BackendError::Config`] when the selected backend's feature is not
-/// compiled in or its settings are invalid.
+/// [`BackendError::Config`] when the settings are invalid.
 pub fn build_tts(config: &TtsConfig) -> Result<Box<dyn TextToSpeech>> {
     match config {
-        #[cfg(feature = "kokoro")]
-        TtsConfig::Kokoro {
-            model_path,
-            voices_path,
-            voice,
-        } => Ok(Box::new(kokoro::KokoroTts::new(
-            model_path,
-            voices_path,
-            voice,
-        )?)),
-        #[cfg(not(feature = "kokoro"))]
-        TtsConfig::Kokoro { .. } => Err(BackendError::Config(
-            "embedded Kokoro is not compiled in: enable the `kokoro` feature, or run Kokoro-FastAPI and use the `open_ai` TTS backend".into(),
-        )),
         TtsConfig::OpenAi {
             base_url,
             model,
@@ -373,5 +297,62 @@ pub fn build_tts(config: &TtsConfig) -> Result<Box<dyn TextToSpeech>> {
             voice,
             api_key_env,
         )?)),
+    }
+}
+
+/// Checks that the speech-to-text server in `config` is reachable.
+///
+/// OpenAI-style servers get a `GET {base_url}/models`; Nemotron gets a
+/// WebSocket connection that is closed again once the server says `Ready`.
+/// Waits at most [`PROBE_TIMEOUT`].
+///
+/// # Errors
+///
+/// [`BackendError::Config`] for an invalid setting, [`BackendError::Transport`]
+/// when the server cannot be reached and [`BackendError::Backend`] when it
+/// answers with an error. Every message names the URL.
+pub async fn probe_stt(config: &SttConfig) -> Result<()> {
+    match config {
+        SttConfig::OpenAi {
+            base_url,
+            api_key_env,
+            ..
+        } => openai::probe_models(base_url, api_key_env).await,
+        SttConfig::Nemotron { url } => nemotron::probe(url).await,
+    }
+}
+
+/// Checks that the chat server in `config` is reachable (`GET {base_url}/models`).
+///
+/// Waits at most [`PROBE_TIMEOUT`].
+///
+/// # Errors
+///
+/// As for [`probe_stt`].
+pub async fn probe_llm(config: &LlmConfig) -> Result<()> {
+    match config {
+        LlmConfig::OpenAi {
+            base_url,
+            api_key_env,
+            ..
+        } => openai::probe_models(base_url, api_key_env).await,
+    }
+}
+
+/// Checks that the speech-synthesis server in `config` is reachable
+/// (`GET {base_url}/models`).
+///
+/// Waits at most [`PROBE_TIMEOUT`].
+///
+/// # Errors
+///
+/// As for [`probe_stt`].
+pub async fn probe_tts(config: &TtsConfig) -> Result<()> {
+    match config {
+        TtsConfig::OpenAi {
+            base_url,
+            api_key_env,
+            ..
+        } => openai::probe_models(base_url, api_key_env).await,
     }
 }

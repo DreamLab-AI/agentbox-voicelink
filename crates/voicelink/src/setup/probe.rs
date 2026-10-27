@@ -9,6 +9,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::choices::Tier;
+use crate::config::Slot;
+use crate::stack::ComposeProfile;
 
 /// What the machine offers.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -40,6 +42,9 @@ pub struct HardwareReport {
 pub struct Proposal {
     /// Proposed tier.
     pub tier: Tier,
+    /// Compose profile to run the stack with (macOS and thin clients: the CPU
+    /// profile is only a fallback; their defaults do not use the stack).
+    pub profile: ComposeProfile,
     /// One line per observation.
     pub evidence: Vec<String>,
 }
@@ -295,7 +300,7 @@ impl HardwareReport {
         } else if self.metal {
             (
                 Tier::Metal,
-                "Apple silicon: Metal-accelerated embedded speech",
+                "Apple silicon: Docker has no GPU on macOS, so run native servers (Homebrew whisper-cpp and llama.cpp, Ollama, LM Studio)",
             )
         } else if !self.rocm_gfx.is_empty() || !self.nvidia.is_empty() || self.real_vulkan() {
             (
@@ -306,7 +311,46 @@ impl HardwareReport {
             (Tier::Cpu, "no usable GPU found")
         };
         ev.push(format!("Proposed tier: {} ({why})", tier.label()));
-        Proposal { tier, evidence: ev }
+        let mut profile = tier.profile();
+        if tier == Tier::RocmLarge && self.rocm_gfx.iter().any(|g| g == "gfx1151") {
+            // Strix Halo: one Mesa RADV stack for every service beats a mixed
+            // ROCm/Vulkan profile that depends on the host's ROCm userspace.
+            profile = ComposeProfile::Vulkan;
+            ev.push(
+                "Compose profile: vulkan (recommended for gfx1151; see compose/README.md)".into(),
+            );
+        } else if matches!(
+            tier,
+            Tier::RocmLarge | Tier::Nvidia | Tier::SmallGpu | Tier::Cpu
+        ) {
+            ev.push(format!("Compose profile: {}", profile.name()));
+        }
+        let uses_stack = matches!(
+            tier,
+            Tier::RocmLarge | Tier::Nvidia | Tier::SmallGpu | Tier::Cpu
+        );
+        if uses_stack && !self.arch.is_empty() {
+            let slots = [Slot::Stt, Slot::Llm, Slot::Tts];
+            let tier_slots: Vec<Slot> = if tier == Tier::Cpu {
+                vec![Slot::Stt, Slot::Tts]
+            } else {
+                slots.to_vec()
+            };
+            for s in crate::stack::unavailable(profile, &tier_slots, &self.arch) {
+                ev.push(format!(
+                    "{}: no {} image for {}, so {} defaults to the agentbox service",
+                    self.arch,
+                    profile.service(s),
+                    self.arch,
+                    s.label()
+                ));
+            }
+        }
+        Proposal {
+            tier,
+            profile,
+            evidence: ev,
+        }
     }
 }
 
@@ -335,6 +379,41 @@ mod tests {
         };
         assert_eq!(r.propose().tier, Tier::RocmLarge);
         assert!(r.propose().evidence.iter().any(|l| l.contains("gfx1151")));
+        // Strix Halo runs every service on Vulkan; other ROCm GPUs get the rocm profile.
+        assert_eq!(r.propose().profile, ComposeProfile::Vulkan);
+        let discrete = HardwareReport {
+            rocm_gfx: vec!["gfx1100".into()],
+            rocm_vram_mib: Some(48 * 1024),
+            ..base()
+        };
+        assert_eq!(discrete.propose().tier, Tier::RocmLarge);
+        assert_eq!(discrete.propose().profile, ComposeProfile::Rocm);
+    }
+
+    #[test]
+    fn arm64_evidence_says_why_speech_leaves_the_stack() {
+        let r = HardwareReport {
+            arch: "aarch64".into(),
+            vulkan: vec![("Mali".into(), "INTEGRATED_GPU".into())],
+            ..base()
+        };
+        let p = r.propose();
+        assert_eq!(p.tier, Tier::SmallGpu);
+        assert!(
+            p.evidence
+                .iter()
+                .any(|l| l.contains("no stt-vulkan image for aarch64")
+                    && l.contains("speech-to-text")),
+            "{:?}",
+            p.evidence
+        );
+        assert!(
+            !base()
+                .propose()
+                .evidence
+                .iter()
+                .any(|l| l.contains("no stt-"))
+        );
     }
 
     #[test]

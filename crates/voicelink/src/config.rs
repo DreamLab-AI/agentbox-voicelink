@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use voicelink_backends::{LlmConfig, SttConfig, TtsConfig};
 
+pub use crate::stack::Stack;
+
 /// Whole client configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -25,8 +27,33 @@ pub struct Config {
     pub llm: LlmConfig,
     /// Text-to-speech backend.
     pub tts: TtsConfig,
-    /// Directory holding downloaded models.
+    /// Directory holding downloaded models (shared with the compose stack).
     pub models_dir: PathBuf,
+    /// The bundled compose stack, when any model slot uses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<Stack>,
+}
+
+/// A model slot: the three things voicelink reaches over the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slot {
+    /// Speech-to-text.
+    Stt,
+    /// The concierge chat model.
+    Llm,
+    /// Text-to-speech.
+    Tts,
+}
+
+impl Slot {
+    /// Short label for messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            Slot::Stt => "speech-to-text",
+            Slot::Llm => "concierge model",
+            Slot::Tts => "text-to-speech",
+        }
+    }
 }
 
 /// Connection to the agentbox host.

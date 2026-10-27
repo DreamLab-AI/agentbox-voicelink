@@ -60,6 +60,40 @@ impl NemotronStt {
     }
 }
 
+/// Opens the WebSocket, waits for the server's first answer and closes again.
+///
+/// `Ready` and an `Error` frame both prove a live server: the server answers
+/// `Error` while another client is streaming, which is not an outage.
+pub(crate) async fn probe(url: &str) -> Result<()> {
+    NemotronStt::new(url)?;
+    let fail = |why: String| BackendError::Transport(format!("{url}: {why}"));
+    let attempt = async {
+        let (ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .map_err(|e| fail(format!("cannot connect ({e})")))?;
+        let (mut tx, mut rx) = ws.split();
+        loop {
+            let m = rx
+                .next()
+                .await
+                .ok_or_else(|| fail("closed before Ready".into()))?
+                .map_err(|e| fail(e.to_string()))?;
+            let Some(v) = unpack(&m).map_err(|e| fail(e.to_string()))? else {
+                continue;
+            };
+            if server_error(&v).is_some() || v.get("type").and_then(Value::as_str) == Some("Ready")
+            {
+                break;
+            }
+        }
+        let _ = tx.close().await;
+        Ok(())
+    };
+    tokio::time::timeout(crate::PROBE_TIMEOUT, attempt)
+        .await
+        .map_err(|_| fail("timed out waiting for Ready".into()))?
+}
+
 fn pack<T: Serialize>(m: &T) -> Result<Message> {
     rmp_serde::to_vec_named(m)
         .map(|v| Message::Binary(v.into()))
