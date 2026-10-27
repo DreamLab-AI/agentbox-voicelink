@@ -21,12 +21,25 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", 
 tracing.workspace = true
 clap.workspace = true
 directories = "6"
+async-trait.workspace = true
+thiserror.workspace = true
+toml = "0.9"
+tracing-subscriber.workspace = true
+rubato = "5"
+aec3 = "0.4"
+earshot = "1"
+cpal = { version = "0.18", optional = true }
+global-hotkey = "0.9"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Same version cpal uses; only to route libasound's stderr chatter into the log (I5).
+alsa = { version = "0.11", optional = true }
 
 [features]
 default = ["audio-io"]
 # Real audio devices through cpal (needs ALSA headers on Linux). Without it the
 # pipeline still builds and its state machine is tested on synthetic buffers.
-audio-io = []
+audio-io = ["dep:cpal", "dep:alsa"]
 
 [lints]
 workspace = true

@@ -1,9 +1,11 @@
 //! `voicelink`: local voice for agent CLIs running in a remote tmux.
 
 mod audio;
+mod concierge;
 mod config;
 mod connect;
 mod daemon;
+mod link;
 mod paths;
 mod setup;
 mod status;
