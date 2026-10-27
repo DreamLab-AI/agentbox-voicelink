@@ -1,0 +1,222 @@
+//! Interchangeable speech-to-text, chat-model and text-to-speech backends.
+//!
+//! Each capability is a trait ([`SpeechToText`], [`ChatModel`],
+//! [`TextToSpeech`]) with implementations chosen at runtime from a serde
+//! config enum ([`SttConfig`], [`LlmConfig`], [`TtsConfig`]):
+//!
+//! | Slot | Embedded (cargo feature) | Local or remote HTTP |
+//! |---|---|---|
+//! | STT | whisper.cpp (`whisper`, `whisper-vulkan`, `whisper-metal`) | OpenAI `/v1/audio/transcriptions`; Nemotron streaming WebSocket |
+//! | LLM | — (always HTTP: a model server outlives the client) | OpenAI `/v1/chat/completions` with tool calls |
+//! | TTS | Kokoro-82M (`kokoro`) | OpenAI `/v1/audio/speech` (Kokoro-FastAPI, Pocket TTS) |
+//!
+//! ROCm and CUDA are reached through the HTTP implementations (a model server
+//! built for that runtime), so client binaries never link a vendor GPU runtime.
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+
+/// Mono PCM audio, `f32` samples in `[-1.0, 1.0]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioClip {
+    /// Samples per second.
+    pub sample_rate: u32,
+    /// Mono samples.
+    pub samples: Vec<f32>,
+}
+
+/// A transcription result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transcript {
+    /// Recognised text, trimmed.
+    pub text: String,
+}
+
+/// Errors from any backend.
+#[derive(Debug, thiserror::Error)]
+pub enum BackendError {
+    /// The backend is misconfigured (missing model file, bad URL, feature not compiled in).
+    #[error("configuration: {0}")]
+    Config(String),
+    /// Transport failure talking to a server.
+    #[error("transport: {0}")]
+    Transport(String),
+    /// The server or engine answered with an error or an unparseable reply.
+    #[error("backend: {0}")]
+    Backend(String),
+    /// The operation was cancelled (receiver dropped).
+    #[error("cancelled")]
+    Cancelled,
+}
+
+/// Result alias for backend operations.
+pub type Result<T> = std::result::Result<T, BackendError>;
+
+/// Speech-to-text.
+#[async_trait]
+pub trait SpeechToText: Send + Sync {
+    /// Transcribes one utterance.
+    async fn transcribe(&self, clip: &AudioClip) -> Result<Transcript>;
+    /// Short human-readable backend name, for status and logs.
+    fn name(&self) -> String;
+}
+
+/// Text-to-speech, streamed.
+#[async_trait]
+pub trait TextToSpeech: Send + Sync {
+    /// Synthesises `text`, sending audio chunks to `sink` as they are produced.
+    /// Returns [`BackendError::Cancelled`] promptly once `sink` is closed, which
+    /// is how a barge-in stops synthesis.
+    async fn synthesize(&self, text: &str, sink: mpsc::Sender<AudioClip>) -> Result<()>;
+    /// Short human-readable backend name.
+    fn name(&self) -> String;
+}
+
+/// A chat model with OpenAI-style tool calling.
+#[async_trait]
+pub trait ChatModel: Send + Sync {
+    /// Runs one completion.
+    async fn chat(&self, request: &ChatRequest) -> Result<ChatMessage>;
+    /// Short human-readable backend name.
+    fn name(&self) -> String;
+}
+
+/// Chat roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// System prompt.
+    System,
+    /// The operator.
+    User,
+    /// The model.
+    Assistant,
+    /// A tool result.
+    Tool,
+}
+
+/// One chat message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    /// Author role.
+    pub role: Role,
+    /// Text content, absent on a pure tool-call message.
+    pub content: Option<String>,
+    /// Tool calls requested by the assistant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// For [`Role::Tool`]: the call being answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// A tool invocation requested by the model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Call id, echoed in the tool result.
+    pub id: String,
+    /// Tool name.
+    pub name: String,
+    /// Parsed JSON arguments.
+    pub arguments: serde_json::Value,
+}
+
+/// A tool the model may call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    /// Tool name.
+    pub name: String,
+    /// What the tool does, for the model.
+    pub description: String,
+    /// JSON Schema of the arguments object.
+    pub parameters: serde_json::Value,
+}
+
+/// One chat completion request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatRequest {
+    /// Conversation so far.
+    pub messages: Vec<ChatMessage>,
+    /// Tools on offer.
+    pub tools: Vec<ToolSpec>,
+    /// Sampling temperature.
+    pub temperature: f32,
+    /// Completion token cap.
+    pub max_tokens: u32,
+}
+
+/// Speech-to-text backend selection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SttConfig {
+    /// whisper.cpp in-process (needs a `whisper*` feature).
+    Whisper {
+        /// Path to a ggml model file.
+        model_path: String,
+        /// Language code, or `None` to auto-detect.
+        language: Option<String>,
+        /// CPU threads.
+        threads: u16,
+        /// Use the GPU backend compiled in (Vulkan or Metal).
+        gpu: bool,
+    },
+    /// OpenAI-compatible `/v1/audio/transcriptions`.
+    OpenAi {
+        /// Base URL up to and including `/v1`.
+        base_url: String,
+        /// Model name sent in the request.
+        model: String,
+        /// Environment variable holding a bearer token, if any.
+        api_key_env: Option<String>,
+    },
+    /// Nemotron streaming ASR WebSocket (`/api/asr-streaming`, MessagePack).
+    Nemotron {
+        /// WebSocket URL.
+        url: String,
+    },
+}
+
+/// Chat model selection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LlmConfig {
+    /// OpenAI-compatible `/v1/chat/completions` (llama-server, Ollama, LM Studio, the Loom).
+    OpenAi {
+        /// Base URL up to and including `/v1`.
+        base_url: String,
+        /// Model name.
+        model: String,
+        /// Environment variable holding a bearer token, if any.
+        api_key_env: Option<String>,
+        /// Extra top-level request fields merged verbatim (for example `{"loom_options":{"scaffold":false}}`).
+        #[serde(default)]
+        extra: serde_json::Map<String, serde_json::Value>,
+    },
+}
+
+/// Text-to-speech backend selection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TtsConfig {
+    /// Kokoro-82M in-process (needs the `kokoro` feature).
+    Kokoro {
+        /// Path to the Kokoro ONNX model.
+        model_path: String,
+        /// Path to the voices file.
+        voices_path: String,
+        /// Voice name.
+        voice: String,
+    },
+    /// OpenAI-compatible `/v1/audio/speech` (Kokoro-FastAPI, Pocket TTS).
+    OpenAi {
+        /// Base URL up to and including `/v1`.
+        base_url: String,
+        /// Model name.
+        model: String,
+        /// Voice name.
+        voice: String,
+        /// Environment variable holding a bearer token, if any.
+        api_key_env: Option<String>,
+    },
+}

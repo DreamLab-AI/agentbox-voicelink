@@ -1,0 +1,21 @@
+[package]
+name = "voicelink-proto"
+version = "0.1.0"
+description = "Wire contract between a voice client and a tmux pane controller: JSON-lines messages, focus-only writes, agent event spool records"
+readme = "README.md"
+keywords = ["tmux", "voice", "protocol", "json-lines", "agent"]
+categories = ["command-line-utilities", "encoding"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

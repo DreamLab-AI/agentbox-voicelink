@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/voicelink-proto",
+    "crates/tmux-control",
+    "crates/voicelink-backends",
+    "crates/voice-paned",
+    "crates/voicelink",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/DreamLab-AI/agentbox-voicelink"
+homepage = "https://github.com/DreamLab-AI/agentbox-voicelink"
+authors = ["DreamLab AI <github@thedreamlab.uk>"]
+
+[workspace.dependencies]
+voicelink-proto = { version = "0.1.0", path = "crates/voicelink-proto" }
+tmux-control = { version = "0.1.0", path = "crates/tmux-control" }
+voicelink-backends = { version = "0.1.0", path = "crates/voicelink-backends", default-features = false }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "process", "sync", "time", "fs", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"

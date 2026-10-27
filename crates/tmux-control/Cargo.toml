@@ -1,0 +1,20 @@
+[package]
+name = "tmux-control"
+version = "0.1.0"
+description = "tmux control-mode (-C) client: notification parser, command/reply correlation, grouped-session helpers"
+readme = "README.md"
+keywords = ["tmux", "control-mode", "terminal", "multiplexer"]
+categories = ["command-line-utilities", "parser-implementations"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

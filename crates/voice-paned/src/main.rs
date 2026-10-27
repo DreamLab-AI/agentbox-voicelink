@@ -1,0 +1,3 @@
+//! voice-paned.
+
+fn main() {}

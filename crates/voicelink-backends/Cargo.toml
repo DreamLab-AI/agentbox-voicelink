@@ -1,0 +1,26 @@
+[package]
+name = "voicelink-backends"
+version = "0.1.0"
+description = "Interchangeable speech-to-text, tool-calling chat and text-to-speech backends: embedded whisper.cpp and Kokoro, or OpenAI-compatible and Nemotron servers"
+readme = "README.md"
+keywords = ["speech", "whisper", "tts", "llm", "voice"]
+categories = ["multimedia::audio", "api-bindings"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
