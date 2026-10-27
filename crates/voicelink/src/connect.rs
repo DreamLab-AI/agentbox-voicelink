@@ -4,10 +4,12 @@
 //! The command builders are pure functions returning argument vectors and the
 //! quoted remote script so they can be tested without running ssh.
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write as _};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -162,15 +164,32 @@ fn master_alive(conn: &Connection, sock: &Path) -> bool {
             .is_ok_and(|s| s.success())
 }
 
-fn ensure_master(conn: &Connection, sock: &Path) -> anyhow::Result<()> {
+/// Runs `cmd` to completion, killing it early once `stop` is set (a hangup or
+/// termination signal reached this process). Returns `None` when interrupted.
+fn run_interruptible(cmd: &mut Command, stop: &AtomicBool) -> anyhow::Result<Option<ExitStatus>> {
+    let mut child = cmd.spawn().context("running ssh (is OpenSSH installed?)")?;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if stop.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn ensure_master(conn: &Connection, sock: &Path, stop: &AtomicBool) -> anyhow::Result<()> {
     if master_alive(conn, sock) {
         return Ok(());
     }
     let _ = std::fs::remove_file(sock);
     // Inherit the terminal: password or passphrase prompts happen here, before tmux owns it (I6).
-    let status = ssh(&master_argv(conn, sock))
-        .status()
-        .context("running ssh (is OpenSSH installed?)")?;
+    let Some(status) = run_interruptible(&mut ssh(&master_argv(conn, sock)), stop)? else {
+        bail!("interrupted while opening the control connection");
+    };
     if !status.success() {
         bail!(
             "ssh could not open the control connection to {} ({status}); check `ssh {}` works, or run `voicelink setup`",
@@ -286,7 +305,19 @@ pub fn run() -> anyhow::Result<()> {
     std::fs::create_dir_all(&state)?;
     let sock = control_socket(&state, conn);
 
-    ensure_master(conn, &sock)?;
+    // Handlers (not SIG_IGN, which children would inherit) so a closed tab or a
+    // kill unwinds through `Link::drop` instead of orphaning the daemon and the
+    // persistent master. The attach child keeps default dispositions.
+    let stop = Arc::new(AtomicBool::new(false));
+    for sig in [
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+    ] {
+        signal_hook::flag::register(sig, Arc::clone(&stop))
+            .context("installing signal handlers")?;
+    }
+    ensure_master(conn, &sock, &stop)?;
     let mut link = Link {
         conn,
         sock: sock.clone(),
@@ -296,12 +327,26 @@ pub fn run() -> anyhow::Result<()> {
 
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
     let colorterm = std::env::var("COLORTERM").unwrap_or_default();
-    let status = ssh(&attach_argv(conn, &sock, &term, &colorterm))
-        .status()
-        .context("attaching through ssh")?;
+    let attach = run_interruptible(
+        &mut ssh(&attach_argv(conn, &sock, &term, &colorterm)),
+        &stop,
+    );
     drop(link);
-    if !status.success() {
-        eprintln!("voicelink: the attach ended with {status}");
+    // The terminal may be gone after a hangup: never panic on a failed write.
+    match attach? {
+        Some(status) if !status.success() => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "voicelink: the attach ended with {status}"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "voicelink: interrupted; stopped the daemon and closed the ssh connection"
+            );
+        }
+        _ => {}
     }
     Ok(())
 }

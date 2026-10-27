@@ -215,6 +215,7 @@ pub enum FieldId {
     OutputDevice,
     Meter,
     RecordPlay,
+    MaxUtterance,
     HotkeyEnabled,
     HotkeyAccel,
     SshDest,
@@ -506,6 +507,12 @@ impl Wizard {
                     Action,
                 ));
                 f.push(field(
+                    MaxUtterance,
+                    "Longest utterance (ms, max 30000)",
+                    c.max_utterance_ms.to_string(),
+                    Text,
+                ));
+                f.push(field(
                     RecordPlay,
                     "Record 3 s and play back",
                     if self.is_busy("record") {
@@ -653,6 +660,11 @@ impl Wizard {
             TtsModel => c.tts_model = s,
             TtsVoice => c.tts_voice = s,
             HotkeyAccel => c.hotkey_accel = s,
+            MaxUtterance => {
+                if let Ok(v) = s.parse::<u32>() {
+                    c.max_utterance_ms = v.min(super::choices::MAX_UTTERANCE_CAP_MS);
+                }
+            }
             SshDest => {
                 c.ssh_destination = s;
                 self.passed.retain(|p| *p != "ssh" && *p != "handshake");

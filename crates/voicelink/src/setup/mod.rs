@@ -79,6 +79,9 @@ pub struct SetupArgs {
     /// Output device name (default: system default).
     #[arg(long)]
     pub output_device: Option<String>,
+    /// Longest utterance passed to STT, in milliseconds (1000 to 30000).
+    #[arg(long)]
+    pub max_utterance_ms: Option<u32>,
     /// Enable the global mute hotkey with this accelerator, for example `Ctrl+Alt+M`.
     #[arg(long)]
     pub hotkey: Option<String>,
@@ -163,6 +166,9 @@ impl SetupArgs {
         }
         if let Some(v) = &self.output_device {
             c.output_device = Some(v.clone());
+        }
+        if let Some(v) = self.max_utterance_ms {
+            c.max_utterance_ms = v;
         }
         if let Some(v) = &self.hotkey {
             c.hotkey_enabled = true;

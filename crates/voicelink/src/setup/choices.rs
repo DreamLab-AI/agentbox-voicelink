@@ -15,6 +15,8 @@ pub const LOOM_PORT: u16 = 18084;
 pub const POCKET_PORT: u16 = 18898;
 /// Local port of the forward to remote Nemotron streaming ASR.
 pub const NEMOTRON_PORT: u16 = 18897;
+/// Hard ceiling for `audio.max_utterance_ms`: the remote Nemotron queue holds about 36 s.
+pub const MAX_UTTERANCE_CAP_MS: u32 = 30_000;
 /// Default ssh destination for the agentbox host.
 pub const DEFAULT_SSH: &str = "machinelearn@192.168.2.132";
 /// Base URLs of the optional local compose stack (`compose/compose.yml`).
@@ -196,6 +198,8 @@ pub struct Choices {
     pub hotkey_enabled: bool,
     /// Hotkey accelerator.
     pub hotkey_accel: String,
+    /// Longest utterance passed to STT, in milliseconds (at most [`MAX_UTTERANCE_CAP_MS`]).
+    pub max_utterance_ms: u32,
     /// Where models live.
     pub models_dir: PathBuf,
     /// The configuration being edited; fields the wizard does not own pass through.
@@ -264,6 +268,7 @@ impl Choices {
             output_device: None,
             hotkey_enabled: false,
             hotkey_accel: "Ctrl+Alt+M".into(),
+            max_utterance_ms: MAX_UTTERANCE_CAP_MS,
             models_dir,
             base,
         }
@@ -290,6 +295,7 @@ impl Choices {
         c.output_device = cfg.audio.output_device.clone();
         c.hotkey_enabled = cfg.hotkey.enabled;
         c.hotkey_accel = cfg.hotkey.mute.clone();
+        c.max_utterance_ms = cfg.audio.max_utterance_ms;
         match &cfg.stt {
             SttConfig::Whisper {
                 model_path, gpu, ..
@@ -436,6 +442,7 @@ impl Choices {
         cfg.audio.output_device = self.output_device.clone();
         cfg.hotkey.enabled = self.hotkey_enabled;
         cfg.hotkey.mute = self.hotkey_accel.clone();
+        cfg.audio.max_utterance_ms = self.max_utterance_ms;
         cfg.models_dir = self.models_dir.clone();
         cfg.stt = match self.stt_kind {
             SttKind::Embedded => {
@@ -450,9 +457,18 @@ impl Choices {
                     .file_name()
                     .and_then(|f| f.to_str())
                     .is_some_and(|f| f.contains(".en"));
+                // Keep a hand-edited language while the model file is unchanged.
+                let language = match &self.base.stt {
+                    SttConfig::Whisper {
+                        model_path,
+                        language,
+                        ..
+                    } if *model_path == path => language.clone(),
+                    _ => english_only.then(|| "en".to_string()),
+                };
                 SttConfig::Whisper {
                     model_path: path,
-                    language: english_only.then(|| "en".to_string()),
+                    language,
                     threads: self.threads(),
                     gpu: self.tier.gpu(),
                 }
@@ -460,7 +476,10 @@ impl Choices {
             SttKind::Http => SttConfig::OpenAi {
                 base_url: self.stt_url.clone(),
                 model: self.stt_model.clone(),
-                api_key_env: None,
+                api_key_env: match &self.base.stt {
+                    SttConfig::OpenAi { api_key_env, .. } => api_key_env.clone(),
+                    _ => None,
+                },
             },
             SttKind::Nemotron => SttConfig::Nemotron {
                 url: nemotron_url(),
@@ -480,6 +499,10 @@ impl Choices {
             api_key_env,
             extra,
         };
+        let base_tts_key = match &self.base.tts {
+            TtsConfig::OpenAi { api_key_env, .. } => api_key_env.clone(),
+            _ => None,
+        };
         cfg.tts = match self.tts_kind {
             TtsKind::Embedded => TtsConfig::Kokoro {
                 model_path: self
@@ -498,13 +521,13 @@ impl Choices {
                 base_url: self.tts_url.clone(),
                 model: self.tts_model.clone(),
                 voice: self.tts_voice.clone(),
-                api_key_env: None,
+                api_key_env: base_tts_key.clone(),
             },
             TtsKind::Pocket => TtsConfig::OpenAi {
                 base_url: pocket_url(),
                 model: "pocket-tts".into(),
                 voice: self.tts_voice.clone(),
-                api_key_env: None,
+                api_key_env: base_tts_key.clone(),
             },
         };
         cfg
@@ -531,6 +554,11 @@ impl Choices {
         }
         if self.llm_model.trim().is_empty() {
             p.push("LLM model name is empty".into());
+        }
+        if !(1000..=MAX_UTTERANCE_CAP_MS).contains(&self.max_utterance_ms) {
+            p.push(format!(
+                "max utterance must be between 1000 and {MAX_UTTERANCE_CAP_MS} ms"
+            ));
         }
         if self.hotkey_enabled && self.hotkey_accel.trim().is_empty() {
             p.push("hotkey accelerator is empty".into());
@@ -689,6 +717,45 @@ mod tests {
             assert_eq!(back.llm_kind, c.llm_kind);
             assert_eq!(back.tts_kind, c.tts_kind);
         }
+    }
+
+    #[test]
+    fn hand_edits_survive_a_rerun() {
+        let mut cfg = Choices::defaults_for(Tier::Cpu, "h").to_config();
+        let model = catalogue::find("whisper-small-q8").unwrap().file;
+        let path = cfg.models_dir.join(model).to_string_lossy().into_owned();
+        cfg.stt = SttConfig::Whisper {
+            model_path: path,
+            language: Some("de".into()),
+            threads: 3,
+            gpu: false,
+        };
+        cfg.tts = TtsConfig::OpenAi {
+            base_url: COMPOSE_TTS.into(),
+            model: "kokoro".into(),
+            voice: "bf_emma".into(),
+            api_key_env: Some("TTS_KEY".into()),
+        };
+        cfg.audio.max_utterance_ms = 12_000;
+        let c = Choices::from_config(&cfg);
+        assert_eq!(c.to_config(), cfg);
+        let mut http = cfg.clone();
+        http.stt = SttConfig::OpenAi {
+            base_url: COMPOSE_STT.into(),
+            model: "whisper-1".into(),
+            api_key_env: Some("STT_KEY".into()),
+        };
+        assert_eq!(Choices::from_config(&http).to_config(), http);
+    }
+
+    #[test]
+    fn utterance_cap_is_enforced() {
+        let mut c = Choices::defaults_for(Tier::Cpu, "h");
+        assert_eq!(c.to_config().audio.max_utterance_ms, 30_000);
+        c.max_utterance_ms = 30_001;
+        assert!(!c.validate().is_empty());
+        c.max_utterance_ms = 20_000;
+        assert!(c.validate().is_empty());
     }
 
     #[test]
