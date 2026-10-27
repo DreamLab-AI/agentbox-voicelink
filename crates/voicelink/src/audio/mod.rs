@@ -40,7 +40,10 @@ pub fn play_clip(audio: &config::Audio, clip: &AudioClip) -> anyhow::Result<()> 
 
 /// Streams input level in dBFS to `on_level` roughly every 50 ms until it
 /// returns `false` (blocking).
-pub fn level_meter(audio: &config::Audio, on_level: &mut dyn FnMut(f32) -> bool) -> anyhow::Result<()> {
+pub fn level_meter(
+    audio: &config::Audio,
+    on_level: &mut dyn FnMut(f32) -> bool,
+) -> anyhow::Result<()> {
     let _ = (audio, on_level);
     anyhow::bail!("audio not built yet")
 }

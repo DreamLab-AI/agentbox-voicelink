@@ -413,7 +413,10 @@ impl SpoolRecord {
                 text.truncate(cut);
             }
         }
-        SpoolRecord { v: SPOOL_RECORD_VERSION, event }
+        SpoolRecord {
+            v: SPOOL_RECORD_VERSION,
+            event,
+        }
     }
 }
 
@@ -472,19 +475,42 @@ mod tests {
     #[test]
     fn every_client_message_round_trips() {
         let all = vec![
-            ClientMessage::Hello { proto: 1, client: "c".into(), view_session: "remote-x".into() },
+            ClientMessage::Hello {
+                proto: 1,
+                client: "c".into(),
+                view_session: "remote-x".into(),
+            },
             ClientMessage::ListPanes { id: 1 },
-            ClientMessage::ReadPane { id: 2, pane: "%1".into(), lines: 40 },
-            ClientMessage::Send { id: 3, text: "fix the build\n".into(), submit: true, force: false },
-            ClientMessage::Keys { id: 4, keys: vec![Key::Digit(2), Key::Enter, Key::Letter('y')] },
+            ClientMessage::ReadPane {
+                id: 2,
+                pane: "%1".into(),
+                lines: 40,
+            },
+            ClientMessage::Send {
+                id: 3,
+                text: "fix the build\n".into(),
+                submit: true,
+                force: false,
+            },
+            ClientMessage::Keys {
+                id: 4,
+                keys: vec![Key::Digit(2), Key::Enter, Key::Letter('y')],
+            },
             ClientMessage::Interrupt { id: 5 },
-            ClientMessage::SelectPane { id: 6, pane: "%12".into() },
+            ClientMessage::SelectPane {
+                id: 6,
+                pane: "%12".into(),
+            },
             ClientMessage::Ping { id: 7 },
             ClientMessage::Bye,
         ];
         for msg in all {
             let line = encode_line(&msg).unwrap();
-            assert_eq!(line.matches('\n').count(), 1, "embedded newline must be escaped: {line}");
+            assert_eq!(
+                line.matches('\n').count(),
+                1,
+                "embedded newline must be escaped: {line}"
+            );
             assert_eq!(decode_line::<ClientMessage>(&line).unwrap(), msg);
         }
     }
@@ -500,7 +526,12 @@ mod tests {
             text: Some("Allow command?".into()),
         };
         let all = vec![
-            ServerMessage::Welcome { proto: 1, server: "s".into(), view_session: "remote-x".into(), focus: focus() },
+            ServerMessage::Welcome {
+                proto: 1,
+                server: "s".into(),
+                view_session: "remote-x".into(),
+                focus: focus(),
+            },
             ServerMessage::Focus(focus()),
             ServerMessage::Panes {
                 id: 1,
@@ -514,11 +545,23 @@ mod tests {
                     focused: true,
                 }],
             },
-            ServerMessage::PaneText { id: 2, pane: "%7".into(), text: "a\nb".into() },
+            ServerMessage::PaneText {
+                id: 2,
+                pane: "%7".into(),
+                text: "a\nb".into(),
+            },
             ServerMessage::Ack { id: 3 },
             ServerMessage::Pong { id: 4 },
-            ServerMessage::Error { id: None, code: ErrorCode::BadHandshake, message: "hello first".into() },
-            ServerMessage::Error { id: Some(5), code: ErrorCode::InputNotEmpty, message: "busy".into() },
+            ServerMessage::Error {
+                id: None,
+                code: ErrorCode::BadHandshake,
+                message: "hello first".into(),
+            },
+            ServerMessage::Error {
+                id: Some(5),
+                code: ErrorCode::InputNotEmpty,
+                message: "busy".into(),
+            },
             ServerMessage::Event(event),
         ];
         for msg in all {
@@ -530,14 +573,25 @@ mod tests {
     #[test]
     fn wire_shape_is_stable() {
         // Pin the JSON shape other implementations rely on.
-        let line = encode_line(&ClientMessage::Keys { id: 9, keys: vec![Key::Digit(1), Key::Enter] }).unwrap();
+        let line = encode_line(&ClientMessage::Keys {
+            id: 9,
+            keys: vec![Key::Digit(1), Key::Enter],
+        })
+        .unwrap();
         assert_eq!(
             line,
             "{\"type\":\"keys\",\"id\":9,\"keys\":[{\"key\":\"digit\",\"value\":1},{\"key\":\"enter\"}]}\n"
         );
         let focus_line = encode_line(&ServerMessage::Focus(focus())).unwrap();
-        let select = encode_line(&ClientMessage::SelectPane { id: 2, pane: "%12".into() }).unwrap();
-        assert_eq!(select, "{\"type\":\"select_pane\",\"id\":2,\"pane\":\"%12\"}\n");
+        let select = encode_line(&ClientMessage::SelectPane {
+            id: 2,
+            pane: "%12".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            select,
+            "{\"type\":\"select_pane\",\"id\":2,\"pane\":\"%12\"}\n"
+        );
         assert_eq!(
             focus_line,
             "{\"type\":\"focus\",\"window\":2,\"window_name\":\"Services\",\"pane\":\"%7\",\"command\":\"codex\",\"agent\":\"codex\"}\n"
@@ -572,27 +626,52 @@ mod tests {
             kind: EventKind::TurnEnd,
             text: Some("é".repeat(MAX_EVENT_TEXT_CHARS + 10)),
         });
-        assert_eq!(rec.event.text.unwrap().chars().count(), MAX_EVENT_TEXT_CHARS);
+        assert_eq!(
+            rec.event.text.unwrap().chars().count(),
+            MAX_EVENT_TEXT_CHARS
+        );
     }
 
     #[test]
     fn rejects_oversized_and_malformed_lines() {
-        let huge = format!("{{\"type\":\"ping\",\"id\":1,\"pad\":\"{}\"}}", "x".repeat(MAX_LINE_BYTES));
-        assert!(matches!(decode_line::<ClientMessage>(&huge), Err(WireError::TooLong(_))));
-        assert!(matches!(decode_line::<ClientMessage>("{\"type\":\"nope\"}"), Err(WireError::Json(_))));
-        assert!(matches!(decode_line::<ClientMessage>("not json"), Err(WireError::Json(_))));
-        let big = ServerMessage::PaneText { id: 1, pane: "%1".into(), text: "x".repeat(MAX_LINE_BYTES) };
+        let huge = format!(
+            "{{\"type\":\"ping\",\"id\":1,\"pad\":\"{}\"}}",
+            "x".repeat(MAX_LINE_BYTES)
+        );
+        assert!(matches!(
+            decode_line::<ClientMessage>(&huge),
+            Err(WireError::TooLong(_))
+        ));
+        assert!(matches!(
+            decode_line::<ClientMessage>("{\"type\":\"nope\"}"),
+            Err(WireError::Json(_))
+        ));
+        assert!(matches!(
+            decode_line::<ClientMessage>("not json"),
+            Err(WireError::Json(_))
+        ));
+        let big = ServerMessage::PaneText {
+            id: 1,
+            pane: "%1".into(),
+            text: "x".repeat(MAX_LINE_BYTES),
+        };
         assert!(matches!(encode_line(&big), Err(WireError::TooLong(_))));
     }
 
     #[test]
     fn crlf_is_tolerated() {
-        assert_eq!(decode_line::<ClientMessage>("{\"type\":\"bye\"}\r\n").unwrap(), ClientMessage::Bye);
+        assert_eq!(
+            decode_line::<ClientMessage>("{\"type\":\"bye\"}\r\n").unwrap(),
+            ClientMessage::Bye
+        );
     }
 
     #[test]
     fn agent_kind_handles_paths() {
-        assert_eq!(AgentKind::from_command("/usr/bin/claude"), AgentKind::Claude);
+        assert_eq!(
+            AgentKind::from_command("/usr/bin/claude"),
+            AgentKind::Claude
+        );
         assert_eq!(AgentKind::from_command("node"), AgentKind::Other);
         assert_eq!(AgentKind::from_command(""), AgentKind::Other);
     }

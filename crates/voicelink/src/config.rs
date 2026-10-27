@@ -122,7 +122,10 @@ impl Default for Audio {
 
 impl Default for Hotkey {
     fn default() -> Self {
-        Hotkey { enabled: false, mute: "Ctrl+Alt+M".into() }
+        Hotkey {
+            enabled: false,
+            mute: "Ctrl+Alt+M".into(),
+        }
     }
 }
 
@@ -144,7 +147,13 @@ impl Connection {
     pub fn agentbox(ssh_destination: impl Into<String>, client_host: &str) -> Self {
         let slug: String = client_host
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c.to_ascii_lowercase() } else { '-' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
             .collect();
         Connection {
             ssh_destination: ssh_destination.into(),
