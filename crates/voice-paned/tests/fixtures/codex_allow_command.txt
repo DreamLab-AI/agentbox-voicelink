@@ -1,0 +1,5 @@
+  Allow command?
+
+  rm -r build
+
+  [y/n]

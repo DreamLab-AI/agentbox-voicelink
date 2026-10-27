@@ -1,0 +1,14 @@
+
+────────────────────────────────────────────────────────────────
+←  ☐ Database  ✔ Submit  →
+
+Which database should the service use?
+
+❯ 1. PostgreSQL
+     Relational, strong consistency
+  2. SQLite
+     Embedded, zero configuration
+  3. Other
+     Type something
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel

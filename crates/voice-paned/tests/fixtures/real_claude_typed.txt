@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.306
+▝▜██████▀  Opus 5.5 · Claude Max
+ ▝▝   ▝▝   /home/devuser/workspace/.tmp/cap/work
+
+
+● ruflo-mods: ruflo mod trust: ruflo-swarm (ruflo-swarm@agentbox) loaded; fs.write (writes files
+  (settings, hooks, helpers included)); process.run (runs host commands); on agent.spawn (can rewrite
+  or answer every agent spawn); on tool.call (can rewrite or answer tool calls); on * (sees every
+  event)
+
+● ruflo-mods: ruflo mod trust: jev-checkpoints (jev-checkpoints@agentbox) loaded; fs.write (writes
+  files (settings, hooks, helpers included)); http.fetch (makes network requests); on tool.call (can
+  rewrite or answer tool calls); on prompt.submit (can add to or rewrite every prompt you send); on
+  agent.spawn (can rewrite or answer every agent spawn)
+
+● ruflo-mods: ruflo mod trust: factrail (factrail@agentbox) loaded; process.run (runs host commands);
+  on tool.call (can rewrite or answer tool calls)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                          ◐ medium · /effort
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ hello world
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

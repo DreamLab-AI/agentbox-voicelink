@@ -1,0 +1,10 @@
+1. Install the dependencies
+2. Run the build
+3. Run the tests
+
+✻ Pondering… (12s · esc to interrupt)
+
+────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────
+  esc to interrupt
