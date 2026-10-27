@@ -317,14 +317,16 @@ pub async fn probe_stt(config: &SttConfig) -> Result<()> {
             base_url,
             api_key_env,
             ..
-        } => openai::probe_models(base_url, api_key_env).await,
+        } => openai::probe_models(base_url, api_key_env, true).await,
         SttConfig::Nemotron { url } => nemotron::probe(url).await,
     }
 }
 
 /// Checks that the chat server in `config` is reachable (`GET {base_url}/models`).
 ///
-/// Waits at most [`PROBE_TIMEOUT`].
+/// Unlike the speech probes, a 404 is an error: every supported chat server
+/// lists its models, so a 404 means a wrong base URL (typically a missing
+/// `/v1`). Waits at most [`PROBE_TIMEOUT`].
 ///
 /// # Errors
 ///
@@ -335,7 +337,7 @@ pub async fn probe_llm(config: &LlmConfig) -> Result<()> {
             base_url,
             api_key_env,
             ..
-        } => openai::probe_models(base_url, api_key_env).await,
+        } => openai::probe_models(base_url, api_key_env, false).await,
     }
 }
 
@@ -353,6 +355,6 @@ pub async fn probe_tts(config: &TtsConfig) -> Result<()> {
             base_url,
             api_key_env,
             ..
-        } => openai::probe_models(base_url, api_key_env).await,
+        } => openai::probe_models(base_url, api_key_env, true).await,
     }
 }

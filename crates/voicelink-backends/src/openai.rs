@@ -76,9 +76,15 @@ fn authed(rb: reqwest::RequestBuilder, key: &Option<String>) -> reqwest::Request
 /// Reachability check shared by every OpenAI-style slot: `GET {base}/models`.
 ///
 /// Any HTTP answer proves the server is up, except credential rejection and
-/// 5xx. 404 and 405 count as up because several speech servers (whisper.cpp's
-/// `whisper-server`, Pocket TTS) have no model listing.
-pub(crate) async fn probe_models(base_url: &str, api_key_env: &Option<String>) -> Result<()> {
+/// 5xx. With `listing_optional`, 404 and 405 also count as up, because several
+/// speech servers (whisper.cpp's `whisper-server`, Pocket TTS) have no model
+/// listing. Chat servers always list models, so for them a 404 means a wrong
+/// base URL (typically a missing `/v1`).
+pub(crate) async fn probe_models(
+    base_url: &str,
+    api_key_env: &Option<String>,
+    listing_optional: bool,
+) -> Result<()> {
     let url = format!("{}/models", base(base_url)?);
     let key = bearer(api_key_env)?;
     let client = http_client(Some(crate::PROBE_TIMEOUT))?;
@@ -93,8 +99,13 @@ pub(crate) async fn probe_models(base_url: &str, api_key_env: &Option<String>) -
         BackendError::Transport(format!("{url}: {why} ({e})"))
     })?;
     let status = resp.status();
-    if status.is_success() || matches!(status.as_u16(), 404 | 405) {
+    if status.is_success() || (listing_optional && matches!(status.as_u16(), 404 | 405)) {
         return Ok(());
+    }
+    if status.as_u16() == 404 {
+        return Err(BackendError::Backend(format!(
+            "{url}: HTTP 404, no model listing here; check the base URL ends in /v1"
+        )));
     }
     Err(BackendError::Backend(format!("{url}: HTTP {status}")))
 }

@@ -632,6 +632,18 @@ async fn probe_openai_distinguishes_up_down_and_http_errors() {
         extra: serde_json::Map::new(),
     };
     probe_llm(&llm).await.unwrap();
+    // A chat base URL without its `/v1` 404s on `/models`: that is a
+    // misconfiguration, not a live server.
+    let llm_no_v1 = LlmConfig::OpenAi {
+        base_url: format!("{host}/ok"),
+        model: "m".into(),
+        api_key_env: None,
+        extra: serde_json::Map::new(),
+    };
+    match probe_llm(&llm_no_v1).await {
+        Err(BackendError::Backend(m)) => assert!(m.contains("404") && m.contains("/v1"), "{m}"),
+        other => panic!("expected a 404 error, got {other:?}"),
+    }
     let tts = TtsConfig::OpenAi {
         base_url: "http://127.0.0.1:1/v1".into(),
         model: "m".into(),
