@@ -6,7 +6,7 @@ Canonical, tool-neutral rules for every coding agent working here. Agentbox side
 
 | Crate | Published | Owns |
 |---|---|---|
-| `voicelink-proto` | crates.io | The JSON-lines wire contract and spool record. Changing a message shape bumps `PROTOCOL_VERSION`. |
+| `voicelink-proto` | crates.io | The JSON-lines wire contract and spool record. Additive changes (new message, enum value, optional field) keep `PROTOCOL_VERSION`; removals or meaning changes bump it. Decoders ignore unknown fields and fall back to `Unknown` variants (see the crate docs). |
 | `tmux-control` | crates.io | Generic tmux control-mode client. No voicelink or agentbox concepts. |
 | `voicelink-backends` | crates.io | `SpeechToText` / `ChatModel` / `TextToSpeech` traits and implementations. No audio I/O, no tmux. |
 | `voice-paned` | no (baked into agentbox from a pinned rev) | Controller: grouped view session, focus following, focus-only writes, spool tailing. |

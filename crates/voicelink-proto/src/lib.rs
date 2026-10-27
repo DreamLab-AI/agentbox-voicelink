@@ -34,6 +34,39 @@
 //! [`SpoolRecord`] lines to a bounded file; the controller tails it and relays
 //! each record as [`ServerMessage::Event`].
 //!
+//! # Compatibility rule
+//!
+//! The two ends are released independently, so versions will differ.
+//!
+//! * **Additive changes keep [`PROTOCOL_VERSION`]:** a new message type, a new
+//!   enum value, a new optional struct field (new fields must be
+//!   `Option`/defaulted so older senders still decode).
+//! * **Removals or changes of meaning bump it:** removing or renaming a
+//!   message, field or value, changing a field's type, or changing what an
+//!   existing request does.
+//!
+//! To make additive changes safe, decoders are tolerant:
+//!
+//! * Unknown struct fields are ignored (`deny_unknown_fields` is never used).
+//! * [`ClientMessage`] and [`ServerMessage`] are internally tagged, with a
+//!   `#[serde(other)]` unit variant `Unknown` that catches any unrecognised
+//!   `type` (the line's other fields are skipped). A controller answers
+//!   [`ClientMessage::Unknown`] with [`ErrorCode::BadRequest`] and keeps going;
+//!   a client logs and ignores [`ServerMessage::Unknown`]. A *known* `type`
+//!   with a malformed body is still an error.
+//! * The unit-only enums [`AgentKind`], [`ErrorCode`] and [`EventKind`] have
+//!   an `Unknown` variant (`#[serde(other)]`) for unrecognised strings.
+//! * [`Key`] is adjacently tagged (`{"key":…,"value":…}`); an unrecognised key
+//!   name, with or without a `value`, decodes as [`Key::Unknown`], which has
+//!   no tmux name and is refused by the controller.
+//! * Every enum crossing the wire is `#[non_exhaustive]`, so `match`es in
+//!   other crates need a wildcard arm and new variants are not a breaking
+//!   change for Rust consumers. Treat `Unknown` like the nearest harmless
+//!   case (`AgentKind::Unknown` as `Other`).
+//!
+//! Never construct an `Unknown` variant to send it; the two message-level
+//! ones refuse to serialise.
+//!
 //! # Example
 //!
 //! ```
@@ -75,6 +108,7 @@ pub type PaneId = String;
 /// Messages sent by the client to the controller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ClientMessage {
     /// Opens the session. Must be the first message.
     Hello {
@@ -108,8 +142,9 @@ pub enum ClientMessage {
         text: String,
         /// Press Enter after the text.
         submit: bool,
-        /// Type even if the pane's input line already holds text. When false
+        /// Type even if the pane's composer already holds text. When false
         /// the controller answers [`ErrorCode::InputNotEmpty`] instead.
+        /// `force` never overrides [`ErrorCode::PromptActive`].
         force: bool,
     },
     /// Presses named keys in the focused pane, in order.
@@ -140,11 +175,18 @@ pub enum ClientMessage {
     },
     /// Ends the session; the controller exits cleanly.
     Bye,
+    /// A message whose `type` this build does not know (a newer peer).
+    /// Decoding only; it is never serialised and must never be constructed
+    /// by a sender. A controller answers it with
+    /// [`ErrorCode::BadRequest`] and carries on.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Messages sent by the controller to the client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ServerMessage {
     /// Accepts a [`ClientMessage::Hello`].
     Welcome {
@@ -196,6 +238,10 @@ pub enum ServerMessage {
     },
     /// An agent event read from the spool (pushed, unsolicited).
     Event(AgentEvent),
+    /// A message whose `type` this build does not know (a newer peer).
+    /// Decoding only; it is never serialised. A client logs and ignores it.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// The focused pane of the view session.
@@ -235,6 +281,7 @@ pub struct PaneInfo {
 /// Agent running in a pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AgentKind {
     /// Claude Code.
     Claude,
@@ -242,6 +289,10 @@ pub enum AgentKind {
     Codex,
     /// Anything else (a shell, an editor, a TUI).
     Other,
+    /// An agent name this build does not know (a newer peer). Treat it like
+    /// [`AgentKind::Other`]. Produced by decoding; a relay re-encodes it as `"unknown"`.
+    #[serde(other)]
+    Unknown,
 }
 
 impl AgentKind {
@@ -265,8 +316,15 @@ impl AgentKind {
 
 /// A key for [`ClientMessage::Keys`]. Deliberately small: free text goes
 /// through [`ClientMessage::Send`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Wire form is adjacently tagged: `{"key":"enter"}`, `{"key":"digit","value":2}`.
+/// serde's `#[serde(other)]` cannot absorb the `value` of an unknown key in
+/// an adjacently tagged enum, so `Deserialize` is implemented by hand: it
+/// reads `{key, value}` generically and maps any unrecognised name (with or
+/// without a `value`) to [`Key::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "key", content = "value", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Key {
     /// Return.
     Enter,
@@ -290,6 +348,45 @@ pub enum Key {
     Digit(u8),
     /// An ASCII letter `a`–`z` or `A`–`Z` (single-key answers such as `y`).
     Letter(char),
+    /// A key name this build does not know (a newer peer). It has no tmux
+    /// name, so a controller refuses the request.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for Key {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        #[derive(Deserialize)]
+        struct Raw {
+            key: String,
+            #[serde(default)]
+            value: Option<serde_json::Value>,
+        }
+        let Raw { key, value } = Raw::deserialize(d)?;
+        let need = |what: &str| {
+            value
+                .clone()
+                .ok_or_else(|| D::Error::custom(format!("key {key:?} needs a {what} value")))
+        };
+        Ok(match key.as_str() {
+            "enter" => Key::Enter,
+            "escape" => Key::Escape,
+            "tab" => Key::Tab,
+            "back_tab" => Key::BackTab,
+            "space" => Key::Space,
+            "up" => Key::Up,
+            "down" => Key::Down,
+            "left" => Key::Left,
+            "right" => Key::Right,
+            "digit" => {
+                Key::Digit(serde_json::from_value(need("number")?).map_err(D::Error::custom)?)
+            }
+            "letter" => {
+                Key::Letter(serde_json::from_value(need("character")?).map_err(D::Error::custom)?)
+            }
+            _ => Key::Unknown,
+        })
+    }
 }
 
 impl Key {
@@ -317,7 +414,7 @@ impl Key {
             Key::Right => "Right".into(),
             Key::Digit(d) if *d <= 9 => d.to_string(),
             Key::Letter(c) if c.is_ascii_alphabetic() => c.to_string(),
-            Key::Digit(_) | Key::Letter(_) => return None,
+            Key::Digit(_) | Key::Letter(_) | Key::Unknown => return None,
         })
     }
 }
@@ -325,6 +422,7 @@ impl Key {
 /// Machine-readable error reasons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ErrorCode {
     /// `Hello.proto` differs from the controller's [`PROTOCOL_VERSION`].
     ProtocolMismatch,
@@ -334,17 +432,29 @@ pub enum ErrorCode {
     BadRequest,
     /// The view session has no focused pane.
     NoFocus,
-    /// `Send` without `force` while the focused pane's input line holds text.
+    /// `Send` without `force` while the focused pane's composer already holds
+    /// text. A forced `Send` is allowed to proceed past this.
     InputNotEmpty,
+    /// A blocking menu or permission prompt is showing in the focused pane of
+    /// a Claude or Codex agent. Answer it with [`ClientMessage::Keys`]:
+    /// [`ClientMessage::Send`] is refused with this code **even when `force`
+    /// is set**, because the first character typed into a menu (a `y`, a
+    /// digit) would answer it.
+    PromptActive,
     /// The named pane or window does not exist.
     NotFound,
     /// tmux reported an error.
     Tmux,
+    /// A reason this build does not know (a newer peer). Treat it as a generic
+    /// failure of the request.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What happened in an agent pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum EventKind {
     /// The agent finished a turn and is waiting for input.
     TurnEnd,
@@ -352,6 +462,9 @@ pub enum EventKind {
     Prompt,
     /// Any other notification the agent raised.
     Notice,
+    /// A kind this build does not know (a newer peer); ignore or log it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// An agent event, as relayed in [`ServerMessage::Event`].
@@ -643,7 +756,7 @@ mod tests {
             Err(WireError::TooLong(_))
         ));
         assert!(matches!(
-            decode_line::<ClientMessage>("{\"type\":\"nope\"}"),
+            decode_line::<ClientMessage>("{\"type\":\"ping\"}"),
             Err(WireError::Json(_))
         ));
         assert!(matches!(
@@ -674,5 +787,154 @@ mod tests {
         );
         assert_eq!(AgentKind::from_command("node"), AgentKind::Other);
         assert_eq!(AgentKind::from_command(""), AgentKind::Other);
+    }
+
+    #[test]
+    fn extra_fields_are_ignored() {
+        let m: ClientMessage =
+            decode_line(r#"{"type":"ping","id":3,"future_field":{"a":[1,2]}}"#).unwrap();
+        assert_eq!(m, ClientMessage::Ping { id: 3 });
+        let m: ServerMessage = decode_line(
+            r#"{"type":"focus","window":2,"window_name":"w","pane":"%7","command":"codex","agent":"codex","zoomed":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m,
+            ServerMessage::Focus(Focus {
+                window: 2,
+                window_name: "w".into(),
+                pane: "%7".into(),
+                command: "codex".into(),
+                agent: AgentKind::Codex
+            })
+        );
+        let rec: SpoolRecord = decode_line(
+            r#"{"v":1,"ts_ms":5,"pane":"%1","window":null,"agent":"claude","kind":"turn_end","text":null,"extra":1}"#,
+        )
+        .unwrap();
+        assert_eq!(rec.event.kind, EventKind::TurnEnd);
+    }
+
+    #[test]
+    fn unknown_message_types_decode_to_unknown() {
+        for line in [
+            r#"{"type":"future"}"#,
+            r#"{"type":"future","id":5,"x":{"y":[1]}}"#,
+            r#"{"id":5,"type":"future","text":"hi"}"#,
+        ] {
+            assert_eq!(
+                decode_line::<ClientMessage>(line).unwrap(),
+                ClientMessage::Unknown,
+                "{line}"
+            );
+            assert_eq!(
+                decode_line::<ServerMessage>(line).unwrap(),
+                ServerMessage::Unknown,
+                "{line}"
+            );
+        }
+        // A known type with a broken body stays an error.
+        assert!(decode_line::<ClientMessage>(r#"{"type":"send","id":1}"#).is_err());
+        // No type at all stays an error.
+        assert!(decode_line::<ClientMessage>(r#"{"id":1}"#).is_err());
+        // The catch-alls cannot be sent.
+        assert!(encode_line(&ClientMessage::Unknown).is_err());
+        assert!(encode_line(&ServerMessage::Unknown).is_err());
+    }
+
+    #[test]
+    fn unknown_enum_values_decode_to_unknown() {
+        let focus: ServerMessage = decode_line(
+            r#"{"type":"focus","window":0,"window_name":"w","pane":"%1","command":"x","agent":"gemini"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            focus,
+            ServerMessage::Focus(Focus {
+                agent: AgentKind::Unknown,
+                ..
+            })
+        ));
+        let err: ServerMessage =
+            decode_line(r#"{"type":"error","id":4,"code":"rate_limited","message":"m"}"#).unwrap();
+        assert!(matches!(
+            err,
+            ServerMessage::Error {
+                id: Some(4),
+                code: ErrorCode::Unknown,
+                ..
+            }
+        ));
+        let ev: ServerMessage = decode_line(
+            r#"{"type":"event","ts_ms":1,"pane":"%1","window":null,"agent":"claude","kind":"cost_alert","text":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            ev,
+            ServerMessage::Event(AgentEvent {
+                kind: EventKind::Unknown,
+                ..
+            })
+        ));
+        let rec: SpoolRecord = decode_line(
+            r#"{"v":2,"ts_ms":5,"pane":"%1","window":null,"agent":"aider","kind":"nap","text":null}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (rec.event.agent, rec.event.kind),
+            (AgentKind::Unknown, EventKind::Unknown)
+        );
+        // A relayed Unknown still encodes.
+        assert!(encode_line(&ServerMessage::Event(rec.event)).is_ok());
+    }
+
+    #[test]
+    fn unknown_keys_decode_to_unknown_with_or_without_a_value() {
+        for line in [
+            r#"{"type":"keys","id":1,"keys":[{"key":"f5"}]}"#,
+            r#"{"type":"keys","id":1,"keys":[{"key":"f5","value":5}]}"#,
+            r#"{"type":"keys","id":1,"keys":[{"key":"f5","value":{"mods":["ctrl"]}}]}"#,
+        ] {
+            let m: ClientMessage = decode_line(line).unwrap();
+            assert_eq!(
+                m,
+                ClientMessage::Keys {
+                    id: 1,
+                    keys: vec![Key::Unknown]
+                },
+                "{line}"
+            );
+        }
+        assert_eq!(Key::Unknown.tmux_name(), None);
+        // A known key with a broken value is an error, not Unknown.
+        assert!(decode_line::<Key>(r#"{"key":"digit","value":"x"}"#).is_err());
+        assert!(decode_line::<Key>(r#"{"key":"digit"}"#).is_err());
+        assert!(decode_line::<Key>(r#"{"key":"digit","value":300}"#).is_err());
+        // Known keys are unaffected.
+        let m: ClientMessage = decode_line(
+            r#"{"type":"keys","id":1,"keys":[{"key":"digit","value":2},{"key":"enter"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m,
+            ClientMessage::Keys {
+                id: 1,
+                keys: vec![Key::Digit(2), Key::Enter]
+            }
+        );
+    }
+
+    #[test]
+    fn prompt_active_has_a_stable_wire_name() {
+        let line = encode_line(&ServerMessage::Error {
+            id: Some(1),
+            code: ErrorCode::PromptActive,
+            message: "m".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            line,
+            "{\"type\":\"error\",\"id\":1,\"code\":\"prompt_active\",\"message\":\"m\"}\n"
+        );
     }
 }

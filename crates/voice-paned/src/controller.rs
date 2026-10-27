@@ -54,8 +54,6 @@ const SCAN_INTERVAL: Duration = Duration::from_millis(1500);
 /// A screen-detected prompt is suppressed if a hook announced one this recently.
 const HOOK_PROMPT_GRACE: Duration = Duration::from_secs(10);
 const ATTACH_ATTEMPTS: usize = 5;
-const NOT_EMPTY_PROMPT: &str =
-    "the agent is showing a prompt; answer it with keys, or send with force";
 
 /// What a request handler can fail with.
 enum Fail {
@@ -545,14 +543,31 @@ async fn handle_line<W: AsyncWrite + Unpin>(
     if text.trim().is_empty() {
         return Ok(Flow::Continue);
     }
+    // Echo the id when the line is JSON carrying one.
+    let raw_id = || {
+        serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("id").and_then(serde_json::Value::as_u64))
+    };
     let msg = match decode_line::<ClientMessage>(&text) {
+        Ok(ClientMessage::Unknown) => {
+            // A newer client's message: refuse it, keep the session.
+            let kind = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str().map(str::to_owned)))
+                .unwrap_or_default();
+            out.error(
+                raw_id(),
+                ErrorCode::BadRequest,
+                format!("unknown message type {kind:?}"),
+            )
+            .await?;
+            return Ok(Flow::Continue);
+        }
         Ok(m) => m,
         Err(e) => {
-            // Echo the id when the line is JSON carrying one.
-            let id = serde_json::from_str::<serde_json::Value>(&text)
-                .ok()
-                .and_then(|v| v.get("id").and_then(serde_json::Value::as_u64));
-            out.error(id, ErrorCode::BadRequest, e.to_string()).await?;
+            out.error(raw_id(), ErrorCode::BadRequest, e.to_string())
+                .await?;
             return Ok(Flow::Continue);
         }
     };
@@ -570,6 +585,12 @@ async fn handle_line<W: AsyncWrite + Unpin>(
         | ClientMessage::Interrupt { id }
         | ClientMessage::SelectPane { id, .. }
         | ClientMessage::Ping { id } => *id,
+        // Unknown was answered above; a variant added later has no id here.
+        _ => {
+            out.error(None, ErrorCode::BadRequest, "unsupported message")
+                .await?;
+            return Ok(Flow::Continue);
+        }
     };
     match handle_request(tmux, msg).await {
         Ok(reply) => {
@@ -641,9 +662,10 @@ async fn handle_request(tmux: &Tmux, msg: ClientMessage) -> Result<ServerMessage
             if text.is_empty() && !submit {
                 return Err(reply_err(ErrorCode::BadRequest, "nothing to send"));
             }
-            if !force && !text.is_empty() {
-                check_input(tmux, &focus).await?;
-            }
+            // Runs for every Send, empty text included (a bare Enter would
+            // accept a menu's highlighted option), and `force` does not skip
+            // the menu check.
+            guard_send(tmux, &focus, force || text.is_empty()).await?;
             if !text.is_empty() {
                 tmux.cmd(["send-keys", "-t", &focus.pane, "-l", "--", &text])
                     .await?;
@@ -695,7 +717,7 @@ async fn handle_request(tmux: &Tmux, msg: ClientMessage) -> Result<ServerMessage
             tmux.cmd(["select-pane", "-t", &pane]).await?;
             Ok(ServerMessage::Ack { id })
         }
-        ClientMessage::Hello { .. } | ClientMessage::Bye => unreachable_request(),
+        _ => unreachable_request(),
     }
 }
 
@@ -703,24 +725,43 @@ fn unreachable_request() -> Result<ServerMessage, Fail> {
     Err(reply_err(ErrorCode::BadRequest, "unexpected message"))
 }
 
-/// `InputNotEmpty` unless the focused pane's input line is empty.
-async fn check_input(tmux: &Tmux, focus: &Focus) -> Result<(), Fail> {
-    let not_empty = |msg: &str| reply_err(ErrorCode::InputNotEmpty, msg);
+/// Refuses a `Send` the focused pane cannot safely take.
+///
+/// * [`ErrorCode::PromptActive`] when a Claude or Codex blocking menu is on
+///   screen right now (a fresh capture, not the scanner's cache), regardless
+///   of `skip_composer`/`force`: the first character typed would answer it.
+/// * [`ErrorCode::InputNotEmpty`] when the composer already holds text,
+///   unless `skip_composer` is set (`force`, or nothing is being typed).
+///
+/// The check and the keystrokes are separate tmux commands, so a menu that
+/// appears in between can still be hit; the window is a few milliseconds.
+async fn guard_send(tmux: &Tmux, focus: &Focus, skip_composer: bool) -> Result<(), Fail> {
+    let not_empty = || {
+        reply_err(
+            ErrorCode::InputNotEmpty,
+            "the input line already holds text",
+        )
+    };
     match focus.agent {
         AgentKind::Claude | AgentKind::Codex => {
             let ansi = tmux.capture(&focus.pane, 0, true).await?.join("\n");
             let plain = input::strip_ansi(&ansi);
             if prompt::detect(focus.agent, &plain).is_some() {
-                return Err(not_empty(NOT_EMPTY_PROMPT));
+                return Err(reply_err(
+                    ErrorCode::PromptActive,
+                    "the agent is showing a menu; answer it with keys",
+                ));
             }
-            if input::input_state(focus.agent, &ansi, "") == InputState::HasText {
-                return Err(not_empty("the input line already holds text"));
+            if !skip_composer && input::input_state(focus.agent, &ansi, "") == InputState::HasText {
+                return Err(not_empty());
             }
         }
-        AgentKind::Other => {
-            let left = tmux.cursor_row_text(&focus.pane).await?;
-            if input::input_state(AgentKind::Other, "", &left) == InputState::HasText {
-                return Err(not_empty("the input line already holds text"));
+        _ => {
+            if !skip_composer {
+                let left = tmux.cursor_row_text(&focus.pane).await?;
+                if input::input_state(AgentKind::Other, "", &left) == InputState::HasText {
+                    return Err(not_empty());
+                }
             }
         }
     }

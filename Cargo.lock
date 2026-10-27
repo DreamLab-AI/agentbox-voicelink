@@ -3842,12 +3842,14 @@ name = "voice-paned"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "fs4",
  "serde_json",
  "tempfile",
  "tmux-control",
  "tokio",
+ "voicelink",
  "voicelink-proto",
 ]
 

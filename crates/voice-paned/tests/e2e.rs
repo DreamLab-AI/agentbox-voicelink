@@ -1049,3 +1049,137 @@ async fn recorder_rotates_an_oversized_spool_itself() {
     let e = ctl.recv_until(next_event).await;
     assert_eq!(e.text.as_deref(), Some("post rotation"));
 }
+
+const CLAUDE_MENU: &str = "Bash command\r\n\r\n Do you want to proceed?\r\n \u{276f} 1. Yes\r\n   2. No, and tell Claude what to do differently (esc)\r\n";
+const CODEX_MENU: &str = "  Would you like to run the following command?\r\n\r\n  $ cargo test --workspace\r\n\r\n\u{203a} 1. Yes, proceed (y)\r\n  2. No, and tell Codex what to do differently (esc)\r\n\r\n  Press enter to confirm or esc to cancel\r\n";
+
+async fn prompt_active_case(command: &str, menu: &str) {
+    use std::time::Duration;
+    let srv = server!();
+    let agent = srv.fake_agent(command, "agent");
+    agent.draw(menu);
+    srv.wait_capture(&agent.pane, "the menu", |c| c.contains("1."));
+    let mut ctl = srv.controller();
+    ctl.handshake("view-pa").await;
+    assert_eq!(
+        ctl.request(
+            C::SelectPane {
+                id: 1,
+                pane: agent.pane.clone()
+            },
+            1
+        )
+        .await,
+        S::Ack { id: 1 }
+    );
+    let before = srv.capture(&agent.pane);
+
+    // Every flavour of Send is refused, `force` included: a leading `y` or a
+    // digit would answer the menu, and a bare Enter accepts the highlighted option.
+    let attempts = [
+        ("yes, run the tests", true, false),
+        ("yes, run the tests", true, true),
+        ("2", false, true),
+        ("", true, true),
+        ("", true, false),
+    ];
+    for (n, (text, submit, force)) in attempts.into_iter().enumerate() {
+        let id = 10 + n as u64;
+        let r = ctl
+            .request(
+                C::Send {
+                    id,
+                    text: text.into(),
+                    submit,
+                    force,
+                },
+                id,
+            )
+            .await;
+        assert_eq!(
+            err_code(&r),
+            ErrorCode::PromptActive,
+            "{text:?} submit={submit} force={force}"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        srv.capture(&agent.pane),
+        before,
+        "a refused Send must leave the pane untouched (tty echo is on)"
+    );
+
+    // Keys still answer the menu.
+    assert_eq!(
+        ctl.request(
+            C::Keys {
+                id: 30,
+                keys: vec![Key::Digit(2)]
+            },
+            30
+        )
+        .await,
+        S::Ack { id: 30 }
+    );
+    srv.wait_capture(&agent.pane, "the digit echoed", |c| c != before);
+
+    // Once the menu is gone a forced Send types again.
+    agent.draw("\u{1b}[2J\u{1b}[H");
+    srv.wait_capture(&agent.pane, "a cleared screen", |c| !c.contains("1."));
+    assert_eq!(
+        ctl.request(
+            C::Send {
+                id: 31,
+                text: "hello".into(),
+                submit: false,
+                force: true
+            },
+            31
+        )
+        .await,
+        S::Ack { id: 31 }
+    );
+    srv.wait_capture(&agent.pane, "hello", |c| c.contains("hello"));
+}
+
+#[tokio::test]
+async fn forced_send_never_types_into_a_claude_menu() {
+    prompt_active_case("claude", CLAUDE_MENU).await;
+}
+
+#[tokio::test]
+async fn forced_send_never_types_into_a_codex_menu() {
+    prompt_active_case("codex", CODEX_MENU).await;
+}
+
+#[tokio::test]
+async fn unknown_message_types_and_keys_are_refused_without_ending_the_session() {
+    let srv = server!();
+    let mut ctl = srv.controller();
+    ctl.handshake("view-unk").await;
+    // A message from the future, with an id and extra fields.
+    ctl.send_raw("{\"type\":\"teleport\",\"id\":77,\"to\":\"%1\"}\n")
+        .await;
+    match ctl.recv().await {
+        S::Error { id, code, message } => {
+            assert_eq!((id, code), (Some(77), ErrorCode::BadRequest));
+            assert!(message.contains("teleport"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // A known request with an extra field works.
+    ctl.send_raw("{\"type\":\"ping\",\"id\":78,\"future\":true}\n")
+        .await;
+    assert_eq!(ctl.recv().await, S::Pong { id: 78 });
+    // An unknown key (with a payload) is a BadRequest, nothing is pressed.
+    ctl.send_raw("{\"type\":\"keys\",\"id\":79,\"keys\":[{\"key\":\"f5\",\"value\":1}]}\n")
+        .await;
+    match ctl.recv().await {
+        S::Error { id, code, .. } => assert_eq!((id, code), (Some(79), ErrorCode::BadRequest)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        ctl.request(C::Ping { id: 80 }, 80).await,
+        S::Pong { id: 80 }
+    );
+}

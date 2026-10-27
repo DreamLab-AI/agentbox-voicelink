@@ -207,7 +207,6 @@ impl LinkHandle {
     }
 
     /// Round-trip liveness check.
-    #[cfg(test)]
     pub async fn ping(&self) -> Result<(), LinkError> {
         match self.request(|id| ClientMessage::Ping { id }).await? {
             ServerMessage::Pong { .. } => Ok(()),
@@ -371,6 +370,13 @@ async fn read_loop(
                     continue;
                 }
                 match decode_line::<ServerMessage>(&line) {
+                    Ok(ServerMessage::Unknown) => {
+                        // A newer controller's message: not ours to interpret.
+                        tracing::info!(
+                            "ignoring a controller message of unknown type: {}",
+                            line.chars().take(120).collect::<String>()
+                        );
+                    }
                     Ok(m) => {
                         if tx.send(ReadEvent::Message(m)).is_err() {
                             return;
@@ -528,6 +534,8 @@ fn route(m: ServerMessage, pending: &mut Pending, notices: &mpsc::UnboundedSende
         | ServerMessage::PaneText { id, .. }
         | ServerMessage::Ack { id }
         | ServerMessage::Pong { id } => reply(id, Ok(m)),
+        // A newer controller's message (the read loop already drops Unknown).
+        _ => tracing::info!("ignoring an unrecognised controller message"),
     }
 }
 
@@ -646,13 +654,15 @@ pub(crate) mod fake {
         pub mismatch: bool,
         /// Close the current session right after the next message.
         pub drop_next: bool,
+        /// Reply `PromptActive` to every `Send`, forced or not.
+        pub prompt_active: bool,
     }
 
     /// Handle to a fake controller plus the connector that reaches it.
     #[derive(Clone)]
     pub(crate) struct FakeController {
         pub script: Arc<Mutex<Script>>,
-        push: Arc<Mutex<Option<mpsc::UnboundedSender<ServerMessage>>>>,
+        push: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
         pub connects: Arc<AtomicU64>,
         pub refuse: Arc<AtomicBool>,
         pub initial_focus: Focus,
@@ -684,10 +694,17 @@ pub(crate) mod fake {
             self.script.lock().unwrap().log.clone()
         }
 
+        /// Pushes a raw line (possibly from a newer controller) to the live session.
+        pub(crate) fn push_raw(&self, line: &str) {
+            if let Some(tx) = self.push.lock().unwrap().as_ref() {
+                let _ = tx.send(format!("{line}\n"));
+            }
+        }
+
         /// Pushes an unsolicited message to the live session.
         pub(crate) fn push(&self, m: ServerMessage) {
             if let Some(tx) = self.push.lock().unwrap().as_ref() {
-                let _ = tx.send(m);
+                let _ = tx.send(encode_line(&m).unwrap());
             }
         }
 
@@ -710,7 +727,7 @@ pub(crate) mod fake {
                     }
                     pushed = prx.recv() => {
                         let Some(m) = pushed else { return };
-                        if w.write_all(encode_line(&m).unwrap().as_bytes()).await.is_err() { return; }
+                        if w.write_all(m.as_bytes()).await.is_err() { return; }
                     }
                 }
             }
@@ -744,6 +761,13 @@ pub(crate) mod fake {
                     pane: pane.clone(),
                     text: s.pane_text.get(pane).cloned().unwrap_or_default(),
                 }],
+                ClientMessage::Send { id, .. } if s.prompt_active => {
+                    vec![ServerMessage::Error {
+                        id: Some(*id),
+                        code: ErrorCode::PromptActive,
+                        message: "a menu is showing".into(),
+                    }]
+                }
                 ClientMessage::Send { id, force, .. } if s.input_not_empty && !force => {
                     vec![ServerMessage::Error {
                         id: Some(*id),
@@ -756,7 +780,7 @@ pub(crate) mod fake {
                 | ClientMessage::Interrupt { id }
                 | ClientMessage::SelectPane { id, .. } => vec![ServerMessage::Ack { id: *id }],
                 ClientMessage::Ping { id } => vec![ServerMessage::Pong { id: *id }],
-                ClientMessage::Bye => vec![],
+                _ => vec![],
             }
         }
     }
@@ -826,6 +850,28 @@ mod tests {
             matches!(&log[0], ClientMessage::Hello { proto, client, view_session }
             if *proto == PROTOCOL_VERSION && client.starts_with("voicelink/") && view_session == "remote-test")
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_server_messages_and_fields_are_ignored() {
+        let fc = FakeController::new(focus(1, "main", "%1", "claude"));
+        let (h, mut notices, _task) = spawn(fc.clone(), fast_config());
+        next_notice(&mut notices).await;
+        fc.push_raw(r#"{"type":"hologram","id":1,"payload":[1,2,3]}"#);
+        fc.push_raw(
+            r#"{"type":"focus","window":4,"window_name":"x","pane":"%4","command":"codex","agent":"codex","zoom":true}"#,
+        );
+        fc.push_raw(
+            r#"{"type":"event","ts_ms":1,"pane":"%4","window":4,"agent":"aider","kind":"cost_alert","text":null}"#,
+        );
+        assert!(matches!(next_notice(&mut notices).await, LinkNotice::Focus(f) if f.window == 4));
+        assert!(matches!(
+            next_notice(&mut notices).await,
+            LinkNotice::Event(e) if e.kind == voicelink_proto::EventKind::Unknown
+        ));
+        // The session survived all of it.
+        h.ping().await.unwrap();
+        assert_eq!(fc.connects.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

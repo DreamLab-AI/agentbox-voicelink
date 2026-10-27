@@ -145,7 +145,7 @@ fn marker_chars(agent: AgentKind) -> &'static [char] {
     match agent {
         AgentKind::Claude => &['\u{276f}', '>'],
         AgentKind::Codex => &['\u{203a}'],
-        AgentKind::Other => &[],
+        _ => &[],
     }
 }
 
@@ -237,7 +237,7 @@ pub fn input_state(agent: AgentKind, ansi_screen: &str, cursor_row_text: &str) -
         AgentKind::Claude | AgentKind::Codex => {
             composer_state(agent, ansi_screen).unwrap_or(InputState::Empty)
         }
-        AgentKind::Other => plain_state(cursor_row_text),
+        _ => plain_state(cursor_row_text),
     }
 }
 

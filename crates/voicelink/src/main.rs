@@ -1,15 +1,9 @@
 //! `voicelink`: local voice for agent CLIs running in a remote tmux.
+//!
+//! The binary is a thin shell over the `voicelink_client` library crate target,
+//! which exists so integration tests can drive the real link and handshake code.
 
-mod audio;
-mod concierge;
-mod config;
-mod connect;
-mod daemon;
-mod link;
-mod paths;
-mod setup;
-mod status;
-mod status_cmd;
+use voicelink_client::{connect, daemon, setup, status_cmd};
 
 use clap::{Parser, Subcommand};
 
