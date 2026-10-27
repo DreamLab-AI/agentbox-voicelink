@@ -52,6 +52,27 @@ chooses its source independently in `voicelink setup`:
 
 Linux builds need ALSA at run time. `voicelink status` shows the daemon's state.
 
+### Build from source
+
+Needs Rust 1.88 or newer, a C toolchain (for `ring`), `pkg-config` and the ALSA
+headers. On Arch or CachyOS:
+
+```sh
+sudo pacman -S --needed base-devel git rustup alsa-lib pkgconf
+rustup default stable
+git clone https://github.com/DreamLab-AI/agentbox-voicelink
+cd agentbox-voicelink
+cargo build --release -p voicelink
+./target/release/voicelink setup      # run from the checkout so compose/ is found
+./target/release/voicelink connect
+```
+
+On Debian or Ubuntu the packages are `build-essential pkg-config libasound2-dev`.
+`cargo install --path crates/voicelink` puts `voicelink` and `agentbox-remote`
+in `~/.cargo/bin`; from there, set `VOICELINK_COMPOSE=/path/to/checkout/compose/compose.yml`
+so the wizard can find the compose stack. The mute hotkey is X11/macOS only;
+`--no-default-features --features audio-io` builds without it.
+
 ## Tiers
 
 The tier decides the compose profile and the model sizes the wizard proposes. You
