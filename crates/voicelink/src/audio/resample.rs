@@ -1,7 +1,7 @@
 //! Streaming and one-shot sample-rate conversion (rubato sinc, mono).
 
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
-use rubato::{Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, WindowFunction};
+use rubato::{Async, FixedAsync, Resampler, SincInterpolationParameters, WindowFunction};
 
 /// Input frames consumed per resampler call.
 const CHUNK: usize = 480;
@@ -12,8 +12,6 @@ const CHUNK: usize = 480;
 /// full internal chunk has been converted. A pass-through when the rates match.
 pub(crate) struct StreamResampler {
     inner: Option<Async<f32>>,
-    from: u32,
-    to: u32,
     pending: Vec<f32>,
     out_buf: Vec<f32>,
 }
@@ -41,17 +39,9 @@ impl StreamResampler {
             .unwrap_or_default();
         Ok(StreamResampler {
             inner,
-            from,
-            to,
             pending: Vec::new(),
             out_buf,
         })
-    }
-
-    /// Source rate in Hz.
-    #[cfg(test)]
-    pub(crate) fn source_rate(&self) -> u32 {
-        self.from
     }
 
     /// Pushes `input` and appends every completed output sample to `out`.
@@ -84,28 +74,18 @@ impl StreamResampler {
             self.pending.drain(..need);
         }
     }
+}
 
-    /// Flushes buffered input (padded with silence) and returns the tail.
-    pub(crate) fn finish(&mut self, out: &mut Vec<f32>) {
-        let Some(r) = self.inner.as_mut() else { return };
-        if self.pending.is_empty() {
+impl StreamResampler {
+    /// Pushes silence through to extract the buffered tail, then starts afresh.
+    pub(crate) fn flush(&mut self, out: &mut Vec<f32>) {
+        if self.inner.is_none() {
             return;
         }
-        let n = self.pending.len();
-        let need = r.input_frames_next();
-        let mut padded = std::mem::take(&mut self.pending);
-        padded.resize(need.max(n), 0.0);
-        let cap = self.out_buf.len();
-        let (Ok(ia), Ok(mut oa)) = (
-            InterleavedSlice::new(&padded[..need], 1, need),
-            InterleavedSlice::new_mut(&mut self.out_buf, 1, cap),
-        ) else {
-            return;
-        };
-        let idx = Indexing::new().partial_len(n);
-        if let Ok((_, written)) = r.process_into_buffer(&ia, &mut oa, Some(&idx)) {
-            let keep = ((n as f64) * f64::from(self.to) / f64::from(self.from)).round() as usize;
-            out.extend_from_slice(&self.out_buf[..written.min(keep.max(1))]);
+        self.process(&vec![0.0; CHUNK * 2], out);
+        self.pending.clear();
+        if let Some(r) = self.inner.as_mut() {
+            r.reset();
         }
     }
 }
@@ -178,8 +158,6 @@ mod tests {
     fn passthrough_when_rates_match() {
         let input = tone(16_000, 200.0, 0.1);
         assert_eq!(resample_clip(&input, 16_000, 16_000).unwrap(), input);
-        let rs = StreamResampler::new(16_000, 16_000).unwrap();
-        assert_eq!(rs.source_rate(), 16_000);
     }
 
     #[test]

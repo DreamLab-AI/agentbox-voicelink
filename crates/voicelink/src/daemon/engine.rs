@@ -105,9 +105,11 @@ fn apply_notice(status: &StatusHandle, n: &LinkNotice, ever_connected: &mut bool
             });
         }
         LinkNotice::Fatal(why) => {
+            // The link will not retry: say so honestly. The daemon stays up
+            // just long enough for the concierge to speak the reason.
             let why = why.clone();
             status.update(|s| {
-                s.state = LinkState::Reconnecting;
+                s.state = LinkState::Stopped;
                 s.last_error = Some(why);
             });
         }
@@ -514,6 +516,57 @@ mod tests {
         })
         .await;
         r.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn protocol_mismatch_is_surfaced_in_status_and_spoken() {
+        let fc = FakeController::new(focus(1, "main", "%1", "claude"));
+        fc.script.lock().unwrap().mismatch = true;
+        let (link, notices, _t) = spawn_link(fc.clone(), fast_config());
+        let tts = Arc::new(FakeTts::default());
+        let status = StatusHandle::new(
+            None,
+            BackendNames {
+                stt: "s".into(),
+                llm: "l".into(),
+                tts: "t".into(),
+            },
+        );
+        let (_audio_tx, audio_events) = mpsc::unbounded_channel();
+        let parts = Parts {
+            stt: Arc::new(FakeStt(Mutex::new(vec![]))),
+            llm: Arc::new(ScriptedLlm::default()),
+            tts: tts.clone(),
+            audio_events,
+            sink: Arc::new(FakeSink::default()),
+            link,
+            notices,
+            audio: config::Audio::default(),
+            concierge: config::Concierge::default(),
+            status: status.clone(),
+        };
+        let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(run(parts, async move {
+            let _ = stop_rx.await;
+        }));
+        until("stopped", || status.snapshot().state == LinkState::Stopped).await;
+        assert!(
+            status
+                .snapshot()
+                .last_error
+                .unwrap()
+                .contains("protocol mismatch")
+        );
+        until("spoken", || {
+            tts.spoken
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| t.contains("protocol mismatch"))
+        })
+        .await;
+        let _ = stop.send(());
+        task.await.unwrap();
     }
 
     #[test]

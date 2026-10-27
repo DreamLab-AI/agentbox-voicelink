@@ -35,6 +35,7 @@ use crate::config;
 
 pub(crate) use playback::{AudioSink, PlaybackQueue};
 
+#[allow(dead_code)] // called by the setup wizard
 /// Audio devices visible to the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceList {
@@ -69,9 +70,11 @@ pub(crate) struct AudioIo {
     pub _guard: Box<dyn std::any::Any + Send>,
 }
 
+#[cfg(not(feature = "audio-io"))]
 const NO_AUDIO_IO: &str =
     "this build has no audio device support (compiled without the `audio-io` feature)";
 
+#[allow(dead_code)] // called by the setup wizard
 /// Lists audio devices.
 pub fn list_devices() -> anyhow::Result<DeviceList> {
     #[cfg(feature = "audio-io")]
@@ -84,6 +87,7 @@ pub fn list_devices() -> anyhow::Result<DeviceList> {
     }
 }
 
+#[allow(dead_code)] // called by the setup wizard
 /// Records `seconds` of mono audio from the configured input (blocking).
 ///
 /// The clip is returned at 16 kHz, ready for speech-to-text.
@@ -99,6 +103,7 @@ pub fn record_clip(audio: &config::Audio, seconds: f32) -> anyhow::Result<AudioC
     }
 }
 
+#[allow(dead_code)] // called by the setup wizard
 /// Plays a clip on the configured output and waits for it to finish (blocking).
 pub fn play_clip(audio: &config::Audio, clip: &AudioClip) -> anyhow::Result<()> {
     #[cfg(feature = "audio-io")]
@@ -112,6 +117,7 @@ pub fn play_clip(audio: &config::Audio, clip: &AudioClip) -> anyhow::Result<()> 
     }
 }
 
+#[allow(dead_code)] // called by the setup wizard
 /// Streams input level in dBFS to `on_level` roughly every 50 ms until it
 /// returns `false` (blocking).
 pub fn level_meter(

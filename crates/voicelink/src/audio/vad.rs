@@ -73,7 +73,7 @@ impl SegmenterConfig {
             preroll_ms: 240,
             start_frames: 3,
             start_frames_while_playing: 12,
-            max_utterance_ms: 30_000,
+            max_utterance_ms: a.max_utterance_ms,
         }
     }
 }
@@ -157,6 +157,16 @@ impl Segmenter {
                 let capped = *frames * FRAME_MS >= self.cfg.max_utterance_ms;
                 if !(ended || capped) {
                     return None;
+                }
+                if capped && !ended {
+                    // Force-cut: hand over everything captured so far and keep
+                    // capturing into a new utterance, with no gap and no loss.
+                    *frames = 0;
+                    *silence_frames = 0;
+                    return Some(AudioEvent::Utterance(AudioClip {
+                        sample_rate: SPEECH_RATE,
+                        samples: std::mem::take(&mut self.buf),
+                    }));
                 }
                 let speech_ms = (*frames - *silence_frames) * FRAME_MS;
                 // Keep a short tail of silence so the STT sees a natural end.
@@ -259,6 +269,50 @@ pub(crate) mod tests {
             .filter(|e| matches!(e, AudioEvent::Utterance(_)))
             .count();
         assert_eq!(utterances, 1);
+    }
+
+    #[test]
+    fn seventy_seconds_of_tone_become_30_30_and_10_second_clips_without_loss() {
+        let mut c = cfg();
+        c.max_utterance_ms = 30_000;
+        let mut s = Segmenter::new(c);
+        let frames = 70 * 16_000 / VAD_FRAME + 5; // 70 s plus rounding up to whole frames
+        let tone: Vec<f32> = (0..VAD_FRAME)
+            .map(|i| 0.3 + (i % 2) as f32 * 0.01)
+            .collect();
+        let mut clips: Vec<Vec<f32>> = Vec::new();
+        let mut started = 0;
+        let mut feed_frame = |s: &mut Segmenter, f: &[f32], score: f32| match s.push(f, score) {
+            Some(AudioEvent::SpeechStarted) => started += 1,
+            Some(AudioEvent::Utterance(c)) => clips.push(c.samples),
+            None => {}
+        };
+        let voiced_frames = 70 * 16_000 / VAD_FRAME; // 4375 exactly
+        for _ in 0..voiced_frames {
+            feed_frame(&mut s, &tone, 1.0);
+        }
+        for _ in 0..(frames - voiced_frames + 40) {
+            feed_frame(&mut s, &vec![0.0; VAD_FRAME], 0.0);
+        }
+        assert_eq!(started, 1, "a force-cut continues the same speech");
+        assert_eq!(clips.len(), 3);
+        assert_eq!(clips[0].len(), 30 * 16_000);
+        assert_eq!(clips[1].len(), 30 * 16_000);
+        // The last clip is the remaining 10 s plus the short silence tail.
+        let last = clips[2].len();
+        assert!(
+            (10 * 16_000..=10 * 16_000 + 3_300).contains(&last),
+            "{last}"
+        );
+        let voiced: usize = clips
+            .iter()
+            .map(|c| c.iter().filter(|v| **v > 0.1).count())
+            .sum();
+        assert_eq!(
+            voiced,
+            voiced_frames * VAD_FRAME,
+            "no voiced sample lost or duplicated"
+        );
     }
 
     #[test]

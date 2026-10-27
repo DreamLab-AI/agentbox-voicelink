@@ -240,4 +240,54 @@ mod tests {
         // With AEC the played signal never reaches the segmenter.
         assert_eq!(first_echo_event_tick(true), None);
     }
+
+    #[test]
+    fn operator_speaking_over_playback_still_triggers_barge_in_with_aec() {
+        let rate = 16_000;
+        let q = PlaybackQueue::new(rate);
+        let mut p = CapturePipeline::new(
+            rate,
+            q.tap(),
+            true,
+            Box::new(EnergyScorer),
+            seg_cfg(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        q.push(AudioClip {
+            sample_rate: rate,
+            samples: noise(rate as usize * 10, 0.3, 9),
+        });
+        let near = noise(rate as usize * 3, 0.5, 4); // uncorrelated, louder than the echo
+        let delay = 800usize;
+        let mut history = vec![0.0f32; delay];
+        let mut started_at = None;
+        for t in 0..900usize {
+            let mut out = vec![0.0; 160];
+            q.fill(&mut out);
+            history.extend_from_slice(&out);
+            let mut mic: Vec<f32> = history[history.len() - 160 - delay..history.len() - delay]
+                .iter()
+                .map(|v| v * 0.5)
+                .collect();
+            if t >= 500 {
+                let off = (t - 500) * 160;
+                if off + 160 <= near.len() {
+                    for (m, n) in mic.iter_mut().zip(&near[off..off + 160]) {
+                        *m += n;
+                    }
+                }
+            }
+            let mut ev = Vec::new();
+            p.push_input(&mic, &mut ev);
+            if ev.contains(&AudioEvent::SpeechStarted) && started_at.is_none() {
+                started_at = Some(t);
+            }
+        }
+        let t = started_at.expect("barge-in never fired");
+        assert!(
+            (500..530).contains(&t),
+            "speech start at tick {t}, burst began at 500"
+        );
+    }
 }

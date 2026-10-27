@@ -370,7 +370,7 @@ impl Concierge {
                 input = inbox.recv() => {
                     let Some(input) = input else { break };
                     match input {
-                        Input::Transcript(t) if is_stop_word(&t) => {
+                        Input::Transcript(t) if is_stop_word(&t) && !(self.st().force.is_some() && is_negative(&t)) => {
                             if let Some(c) = current.take() { c.abort(); }
                             queue.clear();
                             self.interrupt_now().await;
@@ -431,6 +431,7 @@ impl Concierge {
 
     /// The "stop" fast path: no LLM, straight to an interrupt.
     pub(crate) async fn interrupt_now(&self) {
+        self.st().force = None;
         match self.link.interrupt().await {
             Ok(()) => self.speak("Interrupted."),
             Err(e) => self.speak(format!("I could not interrupt: {e}.")),
@@ -1345,6 +1346,45 @@ mod tests {
             "the answer is resolved deterministically"
         );
         assert_eq!(drain(&mut r.said), vec!["Sent.".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn cancel_answers_the_send_anyway_question_instead_of_interrupting() {
+        let mut r = rig(config::Concierge::default()).await;
+        r.fc.script.lock().unwrap().input_not_empty = true;
+        r.llm.push(calls(vec![call(
+            "c1",
+            "send_to_focused",
+            json!({"text": "run the tests"}),
+        )]));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let run = tokio::spawn(Arc::clone(&r.concierge).run(rx));
+        tx.send(Input::Transcript("run the tests".into())).unwrap();
+        for _ in 0..100 {
+            if r.concierge.st().force.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(r.concierge.st().force.is_some());
+        tx.send(Input::Transcript("Cancel.".into())).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tx.send(Input::Transcript("yes".into())).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let log = r.fc.log();
+        assert!(
+            !log.iter()
+                .any(|m| matches!(m, ClientMessage::Interrupt { .. })),
+            "{log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|m| matches!(m, ClientMessage::Send { force: true, .. })),
+            "{log:?}"
+        );
+        assert!(drain(&mut r.said).contains(&"Okay, not sending.".to_string()));
+        drop(tx);
+        run.await.unwrap();
     }
 
     #[tokio::test]

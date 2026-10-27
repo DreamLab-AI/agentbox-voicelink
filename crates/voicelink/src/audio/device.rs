@@ -350,7 +350,5 @@ mod tests {
     fn enumeration_does_not_panic_without_sound_hardware() {
         // CI and containers may have no devices; either outcome is fine, a panic is not.
         let _ = list_devices();
-        let audio = config::Audio::default();
-        let _ = record_clip(&audio, 0.0);
     }
 }

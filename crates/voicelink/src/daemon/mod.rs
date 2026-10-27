@@ -25,6 +25,8 @@ const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Sends tracing output to the daemon log file; silent if it cannot be opened.
 fn init_logging() {
+    // A panic message would otherwise go to stderr, i.e. the operator's terminal.
+    std::panic::set_hook(Box::new(|info| tracing::error!("panic: {info}")));
     let Ok(path) = paths::log_file() else { return };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -46,8 +48,6 @@ fn init_logging() {
         .with_ansi(false)
         .with_env_filter(filter)
         .try_init();
-    // A panic message would otherwise go to stderr, i.e. the operator's terminal.
-    std::panic::set_hook(Box::new(|info| tracing::error!("panic: {info}")));
 }
 
 fn load_config() -> anyhow::Result<Config> {
