@@ -9,6 +9,11 @@ Wire contract between a voice client and a tmux pane controller, used by
 - **Focus-only writes**: `Send`, `Keys` and `Interrupt` have no pane argument;
   they act on the pane focused in the client's own grouped tmux session.
   Reads (`ReadPane`, `ListPanes`) may address any pane.
+- **Menus are never typed into**: `Send` is refused with `PromptActive` while
+  a Claude or Codex menu is showing, even with `force`; answer with `Keys`.
+- **Version skew is tolerated**: unknown fields are ignored and unknown
+  message types, enum values and keys decode to `Unknown` variants. Additive
+  changes keep `PROTOCOL_VERSION`; removals or meaning changes bump it.
 - **Event spool**: `SpoolRecord` is the line format agent hooks append and
   the controller relays as `Event`.
 
