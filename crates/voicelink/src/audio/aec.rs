@@ -82,12 +82,9 @@ pub(crate) mod tests {
     fn run(far: &[f32], near: &[f32], delay_ms: i32) -> Vec<f32> {
         let mut aec = EchoCanceller::new(delay_ms).unwrap();
         let mut out = Vec::new();
-        for (f, n) in far
-            .as_chunks::<AEC_FRAME>()
-            .0
-            .iter()
-            .zip(near.chunks_exact(AEC_FRAME))
-        {
+        let (far, _) = far.as_chunks::<AEC_FRAME>();
+        let (near, _) = near.as_chunks::<AEC_FRAME>();
+        for (f, n) in far.iter().zip(near) {
             out.extend(aec.process(f, n));
         }
         out
