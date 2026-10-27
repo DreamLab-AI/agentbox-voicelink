@@ -1,0 +1,86 @@
+name: release
+
+# Pushing a tag `v*` builds the `voicelink` client for each tier and attaches
+# voicelink-<target>-<backend>.tar.gz plus a .sha256 file to a GitHub release.
+#
+# macOS binaries are UNSIGNED and not notarised. After downloading, Gatekeeper
+# quarantines them; clear it with:
+#     xattr -d com.apple.quarantine voicelink agentbox-remote
+#
+# Embedded backends are CPU, Vulkan (Linux) or Metal (macOS) only; ROCm and
+# CUDA are reached through HTTP model servers (see compose/), never linked.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  create:
+    name: create draft release
+    runs-on: ubuntu-latest
+    steps:
+      # Created once, before the matrix, so the legs cannot race to create it.
+      - run: gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --draft --verify-tag --title "$TAG" --generate-notes
+
+  build:
+    name: build ${{ matrix.target }} (${{ matrix.backend }})
+    needs: create
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, backend: cpu, features: "voicelink-backends/whisper,voicelink-backends/kokoro" }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, backend: vulkan, features: "voicelink-backends/whisper-vulkan,voicelink-backends/kokoro" }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, backend: cpu, features: "voicelink-backends/whisper,voicelink-backends/kokoro" }
+          - { os: macos-14, target: aarch64-apple-darwin, backend: metal, features: "voicelink-backends/whisper-metal,voicelink-backends/kokoro" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+      - name: Linux build packages
+        if: runner.os == 'Linux'
+        # libasound2-dev: cpal. cmake, clang: whisper.cpp and its bindgen bindings.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev cmake build-essential pkg-config libclang-dev
+      - name: Vulkan SDK (whisper.cpp Vulkan backend)
+        if: runner.os == 'Linux' && matrix.backend == 'vulkan'
+        # Headers and loader for linking, glslc to compile the shaders.
+        run: sudo apt-get install -y --no-install-recommends libvulkan-dev glslc spirv-headers
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p voicelink --bin voicelink --bin agentbox-remote --features ${{ matrix.features }}
+      - name: Package
+        id: pack
+        env:
+          TARGET: ${{ matrix.target }}
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          set -euo pipefail
+          name="voicelink-${TARGET}-${BACKEND}"
+          mkdir "$name"
+          cp "target/${TARGET}/release/voicelink" "target/${TARGET}/release/agentbox-remote" LICENSE-MIT LICENSE-APACHE README.md "$name/"
+          tar -czf "${name}.tar.gz" "$name"
+          if command -v sha256sum >/dev/null; then sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"; else shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"; fi
+          cat "${name}.tar.gz.sha256"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+      - name: Upload to the release
+        env:
+          NAME: ${{ steps.pack.outputs.name }}
+        run: gh release upload "$TAG" "${NAME}.tar.gz" "${NAME}.tar.gz.sha256" --clobber
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh release edit "$TAG" --draft=false
