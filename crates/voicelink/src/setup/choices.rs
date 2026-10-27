@@ -429,7 +429,8 @@ impl Choices {
     }
 
     /// The forwards the choices need (named `loom`, `pocket`, `nemotron`),
-    /// followed by any custom forwards carried over from the previous config.
+    /// preserving their configured remote targets, followed by any custom
+    /// forwards carried over from the previous config.
     pub fn forwards(&self) -> Vec<Forward> {
         let mut out = Vec::new();
         if self.stt_source == Source::Remote {
@@ -452,6 +453,19 @@ impl Choices {
                 local_port: POCKET_PORT,
                 remote: "127.0.0.1:8898".into(),
             });
+        }
+        // A model service can live on another host reachable from the SSH host.
+        // The wizard owns the local ports, but must not reset those destinations.
+        for forward in &mut out {
+            if let Some(saved) = self
+                .base
+                .connection
+                .forwards
+                .iter()
+                .find(|saved| saved.name == forward.name)
+            {
+                forward.remote.clone_from(&saved.remote);
+            }
         }
         out.extend(
             self.base
@@ -807,6 +821,25 @@ mod tests {
         assert!(!c.validate().is_empty());
         c.max_utterance_ms = 20_000;
         assert!(c.validate().is_empty());
+    }
+
+    #[test]
+    fn setup_preserves_remote_service_hosts_and_removes_unused_forwards() {
+        let mut cfg = defaults(Tier::Thin).to_config();
+        for forward in &mut cfg.connection.forwards {
+            forward.remote = forward.remote.replace("127.0.0.1", "10.0.0.10");
+        }
+        let mut choices = Choices::from_config(&cfg);
+        assert_eq!(
+            choices.to_config().connection.forwards,
+            cfg.connection.forwards
+        );
+
+        choices.llm_source = Source::Local;
+        let forwards = choices.to_config().connection.forwards;
+        assert_eq!(forwards.len(), 2);
+        assert!(forwards.iter().all(|f| f.name != "loom"));
+        assert!(forwards.iter().all(|f| f.remote.starts_with("10.0.0.10:")));
     }
 
     #[test]
