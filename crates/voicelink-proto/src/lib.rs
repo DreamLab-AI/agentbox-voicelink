@@ -408,10 +408,10 @@ impl SpoolRecord {
     /// assert_eq!(rec.event.text.unwrap().chars().count(), 4000);
     /// ```
     pub fn new(mut event: AgentEvent) -> Self {
-        if let Some(text) = event.text.as_mut() {
-            if let Some((cut, _)) = text.char_indices().nth(MAX_EVENT_TEXT_CHARS) {
-                text.truncate(cut);
-            }
+        if let Some(text) = event.text.as_mut()
+            && let Some((cut, _)) = text.char_indices().nth(MAX_EVENT_TEXT_CHARS)
+        {
+            text.truncate(cut);
         }
         SpoolRecord {
             v: SPOOL_RECORD_VERSION,

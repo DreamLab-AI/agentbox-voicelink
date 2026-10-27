@@ -23,23 +23,36 @@ clap.workspace = true
 directories = "6"
 async-trait.workspace = true
 thiserror.workspace = true
-toml = "0.9"
+toml = "1"
 tracing-subscriber.workspace = true
 rubato = "5"
 aec3 = "0.4"
 earshot = "1"
 cpal = { version = "0.18", optional = true }
 global-hotkey = "0.9"
+ratatui = "0.30"
+ureq = { version = "3", features = ["json"] }
+sha2 = "0.10"
+nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
+signal-hook = { version = "0.3", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Same version cpal uses; only to route libasound's stderr chatter into the log (I5).
 alsa = { version = "0.11", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 default = ["audio-io"]
 # Real audio devices through cpal (needs ALSA headers on Linux). Without it the
 # pipeline still builds and its state machine is tested on synthetic buffers.
 audio-io = ["dep:cpal", "dep:alsa"]
+# Embedded engines, forwarded to voicelink-backends. Without them STT/TTS run over HTTP.
+whisper = ["voicelink-backends/whisper"]
+whisper-vulkan = ["voicelink-backends/whisper-vulkan"]
+whisper-metal = ["voicelink-backends/whisper-metal"]
+kokoro = ["voicelink-backends/kokoro"]
 
 [lints]
 workspace = true

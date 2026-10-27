@@ -83,7 +83,9 @@ pub(crate) mod tests {
         let mut aec = EchoCanceller::new(delay_ms).unwrap();
         let mut out = Vec::new();
         for (f, n) in far
-            .chunks_exact(AEC_FRAME)
+            .as_chunks::<AEC_FRAME>()
+            .0
+            .iter()
             .zip(near.chunks_exact(AEC_FRAME))
         {
             out.extend(aec.process(f, n));

@@ -70,6 +70,13 @@ mod whisper;
 pub use audio::{decode_wav, encode_wav, resample};
 pub use nemotron::NEMOTRON_MAX_UTTERANCE;
 
+/// Whether embedded whisper.cpp ([`SttConfig::Whisper`]) is compiled in
+/// (any of the `whisper`, `whisper-vulkan` or `whisper-metal` features).
+pub const EMBEDDED_WHISPER: bool = cfg!(feature = "whisper");
+
+/// Whether embedded Kokoro ([`TtsConfig::Kokoro`]) is compiled in (the `kokoro` feature).
+pub const EMBEDDED_KOKORO: bool = cfg!(feature = "kokoro");
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;

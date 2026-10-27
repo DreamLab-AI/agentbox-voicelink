@@ -82,10 +82,10 @@ impl StatusHandle {
         let mut s = self.lock();
         f(&mut s);
         s.updated_ms = now_ms();
-        if let Some(path) = &self.inner.path {
-            if let Err(e) = write_atomic(path, &s) {
-                tracing::warn!("cannot write status file {}: {e}", path.display());
-            }
+        if let Some(path) = &self.inner.path
+            && let Err(e) = write_atomic(path, &s)
+        {
+            tracing::warn!("cannot write status file {}: {e}", path.display());
         }
     }
 

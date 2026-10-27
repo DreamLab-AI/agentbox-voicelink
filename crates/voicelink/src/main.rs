@@ -22,9 +22,13 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Run the onboarding wizard (also runs automatically when no config exists).
-    Setup,
+    Setup {
+        #[command(flatten)]
+        args: setup::SetupArgs,
+    },
     /// Attach this terminal to agentbox and start the voice link (the default).
     Connect,
     /// Run the voice daemon over an established ssh ControlMaster (started by `connect`).
@@ -40,7 +44,7 @@ enum Command {
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command.unwrap_or(Command::Connect) {
-        Command::Setup => setup::run(),
+        Command::Setup { args } => setup::run(args),
         Command::Connect => connect::run(),
         Command::Daemon { control_path } => daemon::run(&control_path),
         Command::Status => status_cmd::run(),

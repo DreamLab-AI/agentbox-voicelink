@@ -384,16 +384,16 @@ impl Concierge {
                     current = None;
                 }
             }
-            if current.is_none() {
-                if let Some(work) = queue.pop_front() {
-                    let me = Arc::clone(&self);
-                    current = Some(tokio::spawn(async move {
-                        match work {
-                            Work::Transcript(t) => me.on_transcript(&t).await,
-                            Work::Event(e) => me.on_event(e).await,
-                        }
-                    }));
-                }
+            if current.is_none()
+                && let Some(work) = queue.pop_front()
+            {
+                let me = Arc::clone(&self);
+                current = Some(tokio::spawn(async move {
+                    match work {
+                        Work::Transcript(t) => me.on_transcript(&t).await,
+                        Work::Event(e) => me.on_event(e).await,
+                    }
+                }));
             }
         }
         if let Some(c) = current {
@@ -765,11 +765,11 @@ impl Concierge {
                 .map(|p| (p.window, p.window_name.clone()))
         };
         let mut found = known(&self.st());
-        if found.is_none() {
-            if let Ok(panes) = self.link.list_panes().await {
-                self.st().panes = panes;
-                found = known(&self.st());
-            }
+        if found.is_none()
+            && let Ok(panes) = self.link.list_panes().await
+        {
+            self.st().panes = panes;
+            found = known(&self.st());
         }
         match (found, ev.window) {
             (Some((w, name)), _) if !name.is_empty() => format!("in tab {w}, {name},"),

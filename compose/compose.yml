@@ -1,0 +1,146 @@
+# Optional local inference stack for voicelink: OpenAI-compatible servers that
+# reach ROCm, CUDA or Vulkan through containers, so the voicelink binary itself
+# never links a vendor GPU runtime (I3) and the LLM stays an HTTP server (I4).
+#
+#   docker compose -f compose/compose.yml --profile vulkan up -d
+#
+# Pick exactly ONE profile (rocm | cuda | vulkan | cpu); they publish the same
+# loopback ports. Everything binds to 127.0.0.1 only.
+#
+#   llm   127.0.0.1:8180/v1   llama.cpp server, started with --jinja (tool calls)
+#   stt   127.0.0.1:8181/v1   whisper.cpp whisper-server on /v1/audio/transcriptions
+#   tts   127.0.0.1:8182/v1   Kokoro-FastAPI on /v1/audio/speech
+#
+# Image tags were checked against the registries on 2026-10-27. The llama.cpp
+# tags are floating (they track master); pin one with LLAMA_TAG_* once you
+# have a build you like.
+name: voicelink-inference
+
+x-models: &models
+  - ${VOICELINK_MODELS_DIR:-${HOME}/.local/share/voicelink/models}:/models:ro
+
+x-llm-base: &llm-base
+  - --model
+  - /models/${LLM_MODEL_FILE:-llm.gguf}
+  - --jinja
+  - --ctx-size
+  - "${LLM_CTX:-16384}"
+  - --host
+  - 0.0.0.0
+  - --port
+  - "8080"
+
+x-llm-gpu: &llm-gpu
+  - --model
+  - /models/${LLM_MODEL_FILE:-llm.gguf}
+  - --jinja
+  - --ctx-size
+  - "${LLM_CTX:-16384}"
+  - --n-gpu-layers
+  - "${LLM_NGL:-99}"
+  - --host
+  - 0.0.0.0
+  - --port
+  - "8080"
+
+x-stt-command: &stt-command
+  - whisper-server --host 0.0.0.0 --port 8080 --model /models/${WHISPER_MODEL_FILE:-ggml-base.en-q8_0.bin} --inference-path /v1/audio/transcriptions
+
+x-nvidia: &nvidia
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: all
+          capabilities: [gpu]
+
+services:
+  # ------------------------------------------------------------------ LLM
+  llm-rocm:
+    profiles: [rocm]
+    image: ghcr.io/ggml-org/llama.cpp:${LLAMA_TAG_ROCM:-server-rocm}
+    command: *llm-gpu
+    devices: [/dev/kfd, /dev/dri]
+    group_add: ["${VIDEO_GID:-44}", "${RENDER_GID:-992}"]
+    security_opt: [seccomp=unconfined]
+    ports: ["127.0.0.1:8180:8080"]
+    volumes: *models
+    restart: unless-stopped
+
+  llm-cuda:
+    profiles: [cuda]
+    image: ghcr.io/ggml-org/llama.cpp:${LLAMA_TAG_CUDA:-server-cuda}
+    command: *llm-gpu
+    deploy: *nvidia
+    ports: ["127.0.0.1:8180:8080"]
+    volumes: *models
+    restart: unless-stopped
+
+  llm-vulkan:
+    profiles: [vulkan]
+    image: ghcr.io/ggml-org/llama.cpp:${LLAMA_TAG_VULKAN:-server-vulkan}
+    command: *llm-gpu
+    devices: [/dev/dri]
+    group_add: ["${VIDEO_GID:-44}", "${RENDER_GID:-992}"]
+    ports: ["127.0.0.1:8180:8080"]
+    volumes: *models
+    restart: unless-stopped
+
+  llm-cpu:
+    profiles: [cpu]
+    image: ghcr.io/ggml-org/llama.cpp:${LLAMA_TAG_CPU:-server}
+    command: *llm-base
+    ports: ["127.0.0.1:8180:8080"]
+    volumes: *models
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ STT
+  # whisper.cpp publishes no server image; its `main*` images carry
+  # whisper-server, so it is started through `bash -c`. Models are the ggml
+  # files `voicelink setup` downloads into the models directory.
+  stt-cuda:
+    profiles: [cuda]
+    image: ghcr.io/ggml-org/whisper.cpp:${WHISPER_TAG_CUDA:-main-cuda}
+    entrypoint: [bash, -c]
+    command: *stt-command
+    deploy: *nvidia
+    ports: ["127.0.0.1:8181:8080"]
+    volumes: *models
+    restart: unless-stopped
+
+  # ROCm hosts use the Vulkan build of whisper.cpp (RADV); there is no ROCm image.
+  stt-vulkan:
+    profiles: [vulkan, rocm]
+    image: ghcr.io/ggml-org/whisper.cpp:${WHISPER_TAG_VULKAN:-main-vulkan}
+    entrypoint: [bash, -c]
+    command: *stt-command
+    devices: [/dev/dri]
+    group_add: ["${VIDEO_GID:-44}", "${RENDER_GID:-992}"]
+    ports: ["127.0.0.1:8181:8080"]
+    volumes: *models
+    restart: unless-stopped
+
+  stt-cpu:
+    profiles: [cpu]
+    image: ghcr.io/ggml-org/whisper.cpp:${WHISPER_TAG_CPU:-main}
+    entrypoint: [bash, -c]
+    command: *stt-command
+    ports: ["127.0.0.1:8181:8080"]
+    volumes: *models
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ TTS
+  # Kokoro-FastAPI bundles the Kokoro-82M weights in the image. Its GPU image
+  # is CUDA only; every other profile uses the CPU image.
+  tts-cuda:
+    profiles: [cuda]
+    image: ghcr.io/remsky/kokoro-fastapi-gpu:${KOKORO_TAG_GPU:-v0.9.0-cu128}
+    deploy: *nvidia
+    ports: ["127.0.0.1:8182:8880"]
+    restart: unless-stopped
+
+  tts-cpu:
+    profiles: [cpu, vulkan, rocm]
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:${KOKORO_TAG_CPU:-v0.9.0}
+    ports: ["127.0.0.1:8182:8880"]
+    restart: unless-stopped

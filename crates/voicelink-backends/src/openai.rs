@@ -431,11 +431,11 @@ impl TextToSpeech for OpenAiTts {
                 }
             }
             let rest: Vec<u8> = it.collect();
-            let mut pairs = rest.chunks_exact(2);
-            for p in &mut pairs {
-                pending.push(i16::from_le_bytes([p[0], p[1]]) as f32 / 32768.0);
+            let (pairs, remainder) = rest.as_chunks::<2>();
+            for p in pairs {
+                pending.push(i16::from_le_bytes(*p) as f32 / 32768.0);
             }
-            if let [b] = pairs.remainder() {
+            if let [b] = remainder {
                 carry = Some(*b);
             }
             while pending.len() >= step {
