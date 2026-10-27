@@ -19,7 +19,7 @@ authors = ["DreamLab AI <github@thedreamlab.uk>"]
 [workspace.dependencies]
 voicelink-proto = { version = "0.1.0", path = "crates/voicelink-proto" }
 tmux-control = { version = "0.1.0", path = "crates/tmux-control" }
-voicelink-backends = { version = "0.1.0", path = "crates/voicelink-backends", default-features = false }
+voicelink-backends = { version = "0.1.0", path = "crates/voicelink-backends" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

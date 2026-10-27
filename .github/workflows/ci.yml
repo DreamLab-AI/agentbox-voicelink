@@ -20,7 +20,7 @@ jobs:
     name: fmt, clippy, test, doc (ubuntu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
@@ -45,7 +45,7 @@ jobs:
     name: MSRV (rust-version 1.88)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Pinned to the 1.88 toolchain, the workspace `rust-version`: a newer
       # language or std feature fails here instead of for a downstream user.
       # No ALSA headers needed: the audio backend is off.
@@ -54,11 +54,38 @@ jobs:
           toolchain: 1.88.0
       - run: cargo check --workspace --no-default-features --locked
 
+  msrv-backends:
+    name: MSRV of voicelink-backends (rust-version 1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The published crate declares 1.85 (edition 2024 plus its dependency set),
+      # lower than the workspace, so it is checked on its own.
+      - run: rustup toolchain install 1.85.0 --profile minimal
+      - run: cargo +1.85.0 check -p voicelink-backends --locked
+
+  headless:
+    name: voice-paned tests without X11 or ALSA (the agentbox Nix build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
+      - name: The hotkey feature must stay out of voice-paned's test closure
+        run: |
+          if cargo tree -p voice-paned --no-default-features -e normal,dev | grep -iE 'global-hotkey|x11|xkb'; then
+            echo "voice-paned's tests pull the hotkey crates again" >&2
+            exit 1
+          fi
+      - run: cargo test -p voice-paned --no-default-features --locked
+
   macos:
     name: build check (macOS, Apple silicon)
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable

@@ -132,9 +132,9 @@ mod tests {
             focus: Some("2:Services codex".into()),
             muted: false,
             backends: BackendNames {
-                stt: "whisper large-v3-turbo".into(),
+                stt: "openai-stt:whisper-1".into(),
                 llm: "openai http://127.0.0.1:8080/v1".into(),
-                tts: "kokoro".into(),
+                tts: "openai-tts:kokoro:af_heart".into(),
             },
             last_stt_ms: Some(310),
             last_reply_ms: None,

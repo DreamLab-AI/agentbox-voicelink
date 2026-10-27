@@ -24,7 +24,10 @@ enum Command {
         args: setup::SetupArgs,
     },
     /// Attach this terminal to agentbox and start the voice link (the default).
-    Connect,
+    Connect {
+        #[command(flatten)]
+        args: connect::ConnectArgs,
+    },
     /// Run the voice daemon over an established ssh ControlMaster (started by `connect`).
     #[command(hide = true)]
     Daemon {
@@ -37,9 +40,11 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
-    match Cli::parse().command.unwrap_or(Command::Connect) {
+    match Cli::parse().command.unwrap_or(Command::Connect {
+        args: Default::default(),
+    }) {
         Command::Setup { args } => setup::run(args),
-        Command::Connect => connect::run(),
+        Command::Connect { args } => connect::run(args),
         Command::Daemon { control_path } => daemon::run(&control_path),
         Command::Status => status_cmd::run(),
     }

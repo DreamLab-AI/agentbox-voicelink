@@ -10,8 +10,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 
+use super::choices::Source;
 use super::effects::{self, Controls};
 use super::wizard::{Finish, Key, Step, Wizard};
+use crate::config::Slot;
 
 /// Restores the terminal when dropped, including on early return or panic
 /// unwinding (`ratatui::init` also installs a panic hook that restores it).
@@ -42,6 +44,7 @@ fn map_key(code: KeyCode, mods: KeyModifiers) -> Option<Key> {
 
 /// Runs the wizard on the terminal until it finishes.
 pub fn run(mut wizard: Wizard) -> anyhow::Result<Finish> {
+    wizard.facts = crate::stack::HostFacts::detect();
     let mut terminal = ratatui::init();
     let _guard = TerminalGuard;
     let (tx, rx) = mpsc::channel();
@@ -93,32 +96,56 @@ impl Wizard {
                 None => v.push("Probing hardware...".into()),
             },
             Step::Speech => {
-                v.push("Embedded builds are CPU, Vulkan (Linux) or Metal (macOS). ROCm and CUDA are reached through an HTTP model server instead.".into());
-                v.push("Remote Nemotron runs on the agentbox host and is reached through an ssh forward (127.0.0.1:18897).".into());
+                v.push("Every model is reached over HTTP. Pick the bundled compose stack, a server already running here, or the agentbox speech plane (Nemotron over an ssh forward, 127.0.0.1:18897).".into());
+                if self.choices.stt_source == Source::Compose {
+                    v.push("whisper.cpp runs in the stack's whisper-server container.".into());
+                }
+                if self.choices.stt_source == Source::Local && self.detect_done && self.detected_for(Slot::Stt).is_empty() {
+                    v.push("No whisper-server found on :8080. Start it with --inference-path /v1/audio/transcriptions, or use the compose stack.".into());
+                }
             }
             Step::Llm => {
                 v.push("The concierge model is always an HTTP server (it outlives this client). It must return structured tool calls.".into());
-                for d in &self.detected {
+                v.push(format!("Size guide for this tier: {}.", self.choices.tier.llm_hint()));
+                for d in self.detected_for(Slot::Llm) {
                     v.push(format!("found {} at {} ({} models)", d.label, d.base_url, d.models.len()));
                 }
-                if self.detect_done && self.detected.is_empty() {
-                    v.push("No server found on :8080, :11434 or :1234. Start llama-server with --jinja, use the compose stack, or pick the Loom.".into());
+                if self.choices.llm_source == Source::Local && self.detect_done && self.detected_for(Slot::Llm).is_empty() {
+                    v.push("No server found on :8080, :11434 or :1234. Start llama-server with --jinja, Ollama or LM Studio, or pick another source.".into());
                 }
-                if self.choices.llm_kind == super::choices::LlmKind::Loom {
+                if self.choices.llm_source == Source::Compose {
+                    v.push(format!("Put a tool-calling GGUF named {} in {} (the stack loads it with --jinja).", self.choices.llm_file, self.choices.models_dir.display()));
+                }
+                if self.choices.llm_source == Source::Remote {
                     v.push("The Loom is reached through an ssh forward: 127.0.0.1:18084 -> 127.0.0.1:8084 on the host (scaffold off).".into());
                 }
             }
-            Step::Voice => v.push("Pocket TTS on the agentbox host is reached through an ssh forward (127.0.0.1:18898 -> 127.0.0.1:8898, /v1/audio/speech).".into()),
+            Step::Voice => {
+                v.push("Compose: Kokoro-FastAPI (the image bundles its Kokoro-82M weights). Remote: Pocket TTS on the agentbox host, 127.0.0.1:18898 -> 127.0.0.1:8898.".into());
+            }
             Step::Models => {
                 let need = self.choices.required_models();
                 if need.is_empty() {
-                    v.push("The chosen backends need no local model files.".into());
+                    v.push("The chosen sources need no model downloads.".into());
                 }
                 for e in need {
                     let have = self.choices.models_dir.join(e.file).exists();
                     v.push(format!("{} {} [{}]", if have { "present" } else { "missing" }, e.label, e.licence));
                 }
-                v.push(format!("into {} (resumable, SHA-256 verified)", self.choices.models_dir.display()));
+                v.push(format!("into {} (resumable, SHA-256 verified), the directory the compose stack mounts", self.choices.models_dir.display()));
+                if !self.choices.stack_slots().is_empty() {
+                    v.extend(self.stack_warnings());
+                    match self.stack_command() {
+                        Some(cmd) => v.push(format!("Stack command: {}", cmd.display())),
+                        None => v.push("compose/compose.yml not found next to the binary: the release tarball ships it as compose/.".into()),
+                    }
+                    if self.choices.tier == super::choices::Tier::RocmLarge && self.choices.profile != crate::stack::ComposeProfile::Vulkan {
+                        v.push("AMD Strix Halo (gfx1151)? The vulkan profile is the recommended one: see compose/README.md.".into());
+                    }
+                }
+                if macos {
+                    v.push("macOS: Docker has no GPU. Install native servers instead: brew install whisper-cpp llama.cpp, or Ollama / LM Studio, then pick 'server already running'.".into());
+                }
             }
             Step::Audio => {
                 if let Some(db) = self.level_db {

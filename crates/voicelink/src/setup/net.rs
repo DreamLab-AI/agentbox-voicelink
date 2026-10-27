@@ -23,22 +23,87 @@ fn agent(connect: Duration, global: Option<Duration>) -> ureq::Agent {
 
 // ---------------------------------------------------------------- detection
 
+use crate::config::Slot;
+
 /// An OpenAI-compatible server found on this machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedServer {
+    /// Which slot it can serve.
+    pub slot: Slot,
     /// Product name.
     pub label: String,
     /// Base URL up to and including `/v1`.
     pub base_url: String,
     /// Model ids from `GET /v1/models`.
     pub models: Vec<String>,
+    /// What else the operator must know to use it.
+    pub note: Option<String>,
+}
+
+/// How a candidate port is recognised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recognise {
+    /// `GET /v1/models` answers with a model list.
+    Models,
+    /// `GET /` is whisper.cpp's server page. `llama-server` and `whisper-server`
+    /// both default to port 8080; only the llama one has `/v1/models`.
+    WhisperRoot,
+}
+
+/// A well-known local server.
+#[derive(Debug, Clone, Copy)]
+pub struct Candidate {
+    /// Slot served.
+    pub slot: Slot,
+    /// Product name.
+    pub label: &'static str,
+    /// Base URL up to and including `/v1`.
+    pub base_url: &'static str,
+    /// Recognition rule.
+    pub how: Recognise,
+    /// Note shown with a hit.
+    pub note: Option<&'static str>,
 }
 
 /// Default ports of the servers we look for.
-pub const CANDIDATES: [(&str, &str); 3] = [
-    ("llama-server", "http://127.0.0.1:8080/v1"),
-    ("Ollama", "http://127.0.0.1:11434/v1"),
-    ("LM Studio", "http://127.0.0.1:1234/v1"),
+pub const CANDIDATES: [Candidate; 5] = [
+    Candidate {
+        slot: Slot::Llm,
+        label: "llama-server",
+        base_url: "http://127.0.0.1:8080/v1",
+        how: Recognise::Models,
+        note: Some("start it with --jinja so tool calls come back structured"),
+    },
+    Candidate {
+        slot: Slot::Llm,
+        label: "Ollama",
+        base_url: "http://127.0.0.1:11434/v1",
+        how: Recognise::Models,
+        note: None,
+    },
+    Candidate {
+        slot: Slot::Llm,
+        label: "LM Studio",
+        base_url: "http://127.0.0.1:1234/v1",
+        how: Recognise::Models,
+        note: None,
+    },
+    Candidate {
+        slot: Slot::Stt,
+        label: "whisper-server",
+        base_url: "http://127.0.0.1:8080/v1",
+        how: Recognise::WhisperRoot,
+        note: Some(
+            "a stock whisper-server serves /inference; start it with --inference-path /v1/audio/transcriptions",
+        ),
+    },
+    Candidate {
+        slot: Slot::Tts,
+        label: "Kokoro-FastAPI",
+        base_url: "http://127.0.0.1:8880/v1",
+        how: Recognise::Models,
+        note: None,
+    },
 ];
 
 /// Model ids from a `/v1/models` reply.
@@ -53,25 +118,50 @@ pub fn parse_models(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether `body` is the whisper.cpp server's landing page.
+pub fn is_whisper_root(body: &str) -> bool {
+    body.contains("Whisper.cpp Server")
+}
+
+fn probe_candidate(c: Candidate) -> Option<DetectedServer> {
+    let a = agent(Duration::from_millis(600), Some(Duration::from_secs(3)));
+    let (models, ok) = match c.how {
+        Recognise::Models => {
+            let mut resp = a.get(&format!("{}/models", c.base_url)).call().ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let v: Value = resp.body_mut().read_json().ok()?;
+            (parse_models(&v), true)
+        }
+        Recognise::WhisperRoot => {
+            let root = c.base_url.trim_end_matches("/v1");
+            let mut resp = a.get(root).call().ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            (
+                Vec::new(),
+                is_whisper_root(&resp.body_mut().read_to_string().ok()?),
+            )
+        }
+    };
+    ok.then(|| DetectedServer {
+        slot: c.slot,
+        label: c.label.into(),
+        base_url: c.base_url.into(),
+        models,
+        note: c.note.map(String::from),
+    })
+}
+
 /// Probes the well-known localhost ports in parallel.
-pub fn detect_llm_servers() -> Vec<DetectedServer> {
+pub fn detect_servers() -> Vec<DetectedServer> {
     let handles: Vec<_> = CANDIDATES
         .iter()
-        .map(|(label, base)| {
-            let (label, base) = (label.to_string(), base.to_string());
-            std::thread::spawn(move || {
-                let a = agent(Duration::from_millis(600), Some(Duration::from_secs(3)));
-                let mut resp = a.get(&format!("{base}/models")).call().ok()?;
-                if !resp.status().is_success() {
-                    return None;
-                }
-                let v: Value = resp.body_mut().read_json().ok()?;
-                Some(DetectedServer {
-                    label,
-                    base_url: base,
-                    models: parse_models(&v),
-                })
-            })
+        .map(|c| {
+            let c = *c;
+            std::thread::spawn(move || probe_candidate(c))
         })
         .collect();
     handles

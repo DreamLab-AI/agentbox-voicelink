@@ -7,11 +7,12 @@ use std::path::PathBuf;
 use serde_json::{Map, Value};
 
 use super::catalogue::{self, Entry};
-use super::choices::{Choices, Engines, LlmKind, Tier, cycle};
+use super::choices::{Choices, Source, Tier, cycle};
 use super::net::{DetectedServer, ToolProbe};
 use super::probe::{HardwareReport, Proposal};
 use crate::audio::DeviceList;
-use crate::config::{self, Config};
+use crate::config::{self, Config, Slot};
+use crate::stack::{ComposeCommand, HostFacts};
 
 /// Wizard pages, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -24,7 +25,7 @@ pub enum Step {
     Llm,
     /// Text-to-speech.
     Voice,
-    /// Model downloads.
+    /// Model downloads and the compose stack.
     Models,
     /// Audio devices.
     Audio,
@@ -60,7 +61,7 @@ impl Step {
             Step::Speech => "Speech to text",
             Step::Llm => "Concierge model",
             Step::Voice => "Text to speech",
-            Step::Models => "Model downloads",
+            Step::Models => "Models and stack",
             Step::Audio => "Audio devices",
             Step::Hotkey => "Mute hotkey",
             Step::Connection => "Connection",
@@ -106,8 +107,8 @@ pub enum Key {
 pub enum Effect {
     /// Probe the hardware.
     Probe,
-    /// Look for local OpenAI-compatible servers.
-    DetectLlm,
+    /// Look for local model servers (llama-server, Ollama, LM Studio, whisper-server, Kokoro-FastAPI).
+    Detect,
     /// Tool-calling probe.
     ToolProbe {
         /// Server base URL.
@@ -127,6 +128,8 @@ pub enum Effect {
     RecordPlayback(config::Audio),
     /// Download catalogue entries into a directory.
     Download(Vec<&'static Entry>, PathBuf),
+    /// Run `docker compose ... up -d` (only ever after an explicit confirmation).
+    StartStack(Box<ComposeCommand>),
     /// `voice-paned --version` over ssh.
     CheckSsh(config::Connection),
     /// Hello/Welcome over ssh.
@@ -156,7 +159,7 @@ pub enum Outcome {
     Progress(String, u64, u64),
     /// A finished action with report lines.
     Lines {
-        /// Which action (`"ssh"`, `"handshake"`, `"download"`, `"record"`, `"smoke"`).
+        /// Which action (`"ssh"`, `"handshake"`, `"download"`, `"stack"`, `"record"`, `"smoke"`).
         what: &'static str,
         /// Whether it succeeded.
         ok: bool,
@@ -195,22 +198,25 @@ pub enum FieldKind {
 pub enum FieldId {
     TierSel,
     Reprobe,
-    SttKindSel,
+    SttSourceSel,
     WhisperModel,
     SttUrl,
     SttModel,
-    LlmKindSel,
-    LlmDetected,
+    LlmSourceSel,
+    DetectedSel,
     Redetect,
     LlmUrl,
     LlmModel,
+    LlmFile,
     ToolProbeRun,
-    TtsKindSel,
-    KokoroVoice,
+    TtsSourceSel,
     TtsUrl,
     TtsModel,
     TtsVoice,
+    PocketVoice,
+    ProfileSel,
     Download,
+    StartStack,
     InputDevice,
     OutputDevice,
     Meter,
@@ -238,6 +244,14 @@ pub struct Field {
     pub kind: FieldKind,
 }
 
+fn slot_index(slot: Slot) -> usize {
+    match slot {
+        Slot::Stt => 0,
+        Slot::Llm => 1,
+        Slot::Tts => 2,
+    }
+}
+
 fn field(id: FieldId, label: &str, value: impl Into<String>, kind: FieldKind) -> Field {
     Field {
         id,
@@ -262,12 +276,16 @@ pub struct Wizard {
     pub hw: Option<HardwareReport>,
     /// Tier proposal and evidence.
     pub proposal: Option<Proposal>,
-    /// Local LLM servers found.
+    /// Local servers found, for every slot.
     pub detected: Vec<DetectedServer>,
     /// Detection has completed.
     pub detect_done: bool,
-    /// Index into `detected` last applied.
-    pub detected_idx: usize,
+    /// Selected server per slot (index into that slot's detected servers).
+    pub detected_idx: [usize; 3],
+    /// Facts about the host (compose file, home, groups).
+    pub facts: HostFacts,
+    /// The start-stack row has been pressed once and awaits confirmation.
+    pub stack_confirm: bool,
     /// Audio devices.
     pub devices: Option<Result<DeviceList, String>>,
     /// Latest input level.
@@ -294,16 +312,10 @@ pub struct Wizard {
 impl Wizard {
     /// Starts a wizard. `existing` pre-fills the choices (re-run).
     pub fn new(existing: Option<&Config>, host: &str) -> Self {
-        Self::with_engines(existing, host, Engines::compiled())
-    }
-
-    /// As [`Wizard::new`], for an explicit set of embedded engines.
-    pub fn with_engines(existing: Option<&Config>, host: &str, engines: Engines) -> Self {
-        let (mut choices, prefilled) = match existing {
+        let (choices, prefilled) = match existing {
             Some(c) => (Choices::from_config(c), true),
-            None => (Choices::defaults_with(engines, Tier::Cpu, host), false),
+            None => (Choices::defaults_for(Tier::Cpu, host), false),
         };
-        choices.engines = engines;
         Wizard {
             step: Step::Hardware,
             choices,
@@ -313,7 +325,9 @@ impl Wizard {
             proposal: None,
             detected: Vec::new(),
             detect_done: false,
-            detected_idx: 0,
+            detected_idx: [0; 3],
+            facts: HostFacts::default(),
+            stack_confirm: false,
             devices: None,
             level_db: None,
             meter_on: false,
@@ -354,9 +368,11 @@ impl Wizard {
                 self.mark_busy("probe");
                 e.push(Effect::Probe);
             }
-            Step::Llm if !self.detect_done && !self.is_busy("detect") => {
+            Step::Speech | Step::Llm | Step::Voice
+                if !self.detect_done && !self.is_busy("detect") =>
+            {
                 self.mark_busy("detect");
-                e.push(Effect::DetectLlm);
+                e.push(Effect::Detect);
             }
             Step::Audio if self.devices.is_none() && !self.is_busy("devices") => {
                 self.mark_busy("devices");
@@ -376,6 +392,7 @@ impl Wizard {
         self.step = step;
         self.cursor = 0;
         self.editing = None;
+        self.stack_confirm = false;
         self.notes.clear();
         e.extend(self.enter_effects());
         e
@@ -414,34 +431,48 @@ impl Wizard {
                 ));
             }
             Step::Speech => {
-                f.push(field(SttKindSel, "Provider", c.stt_kind.label(), Choice));
-                match c.stt_kind {
-                    super::choices::SttKind::Embedded => {
-                        let label = match (&c.whisper_path_override, c.whisper_entry()) {
+                f.push(field(
+                    SttSourceSel,
+                    "Source",
+                    c.stt_source.label(Slot::Stt),
+                    Choice,
+                ));
+                match c.stt_source {
+                    Source::Compose => {
+                        let label = match (&c.whisper_override, c.whisper_entry()) {
                             (Some(p), _) => format!("custom file {p}"),
                             (None, Some(e)) => e.label.to_string(),
                             _ => c.whisper_model.clone(),
                         };
-                        f.push(field(WhisperModel, "Model", label, Choice));
+                        f.push(field(WhisperModel, "Whisper model", label, Choice));
                     }
-                    super::choices::SttKind::Http => {
+                    Source::Local => {
+                        self.push_detected(&mut f, Slot::Stt);
                         f.push(field(SttUrl, "Base URL", &c.stt_url, Text));
                         f.push(field(SttModel, "Model name", &c.stt_model, Text));
                     }
-                    super::choices::SttKind::Nemotron => {}
+                    Source::Remote => {}
                 }
             }
             Step::Llm => {
-                f.push(field(LlmKindSel, "Provider", c.llm_kind.label(), Choice));
-                if c.llm_kind == super::choices::LlmKind::Local {
-                    let found = match self.detected.get(self.detected_idx) {
-                        Some(d) => format!("{} at {}", d.label, d.base_url),
-                        None if self.detect_done => "none found".to_string(),
-                        None => "looking...".to_string(),
-                    };
-                    f.push(field(LlmDetected, "Detected server", found, Choice));
-                    f.push(field(Redetect, "Detect again", "", Action));
-                    f.push(field(LlmUrl, "Base URL", &c.llm_url, Text));
+                f.push(field(
+                    LlmSourceSel,
+                    "Source",
+                    c.llm_source.label(Slot::Llm),
+                    Choice,
+                ));
+                match c.llm_source {
+                    Source::Compose => f.push(field(
+                        LlmFile,
+                        "GGUF file (in the models dir)",
+                        &c.llm_file,
+                        Text,
+                    )),
+                    Source::Local => {
+                        self.push_detected(&mut f, Slot::Llm);
+                        f.push(field(LlmUrl, "Base URL", &c.llm_url, Text));
+                    }
+                    Source::Remote => {}
                 }
                 f.push(field(LlmModel, "Model name", &c.llm_model, Text));
                 f.push(field(
@@ -456,22 +487,32 @@ impl Wizard {
                 ));
             }
             Step::Voice => {
-                f.push(field(TtsKindSel, "Provider", c.tts_kind.label(), Choice));
-                match c.tts_kind {
-                    super::choices::TtsKind::Embedded => {
-                        f.push(field(KokoroVoice, "Voice", &c.kokoro_voice, Text))
-                    }
-                    super::choices::TtsKind::Http => {
-                        f.push(field(TtsUrl, "Base URL", &c.tts_url, Text));
-                        f.push(field(TtsModel, "Model name", &c.tts_model, Text));
-                        f.push(field(TtsVoice, "Voice", &c.tts_voice, Text));
-                    }
-                    super::choices::TtsKind::Pocket => {
-                        f.push(field(TtsVoice, "Voice", &c.tts_voice, Text))
-                    }
+                f.push(field(
+                    TtsSourceSel,
+                    "Source",
+                    c.tts_source.label(Slot::Tts),
+                    Choice,
+                ));
+                if c.tts_source == Source::Local {
+                    self.push_detected(&mut f, Slot::Tts);
+                    f.push(field(TtsUrl, "Base URL", &c.tts_url, Text));
+                    f.push(field(TtsModel, "Model name", &c.tts_model, Text));
+                }
+                if c.tts_source == Source::Remote {
+                    f.push(field(PocketVoice, "Pocket voice", &c.pocket_voice, Text));
+                } else {
+                    f.push(field(TtsVoice, "Voice", &c.tts_voice, Text));
                 }
             }
             Step::Models => {
+                if !c.stack_slots().is_empty() {
+                    f.push(field(
+                        ProfileSel,
+                        "Compose profile",
+                        c.profile.name(),
+                        Choice,
+                    ));
+                }
                 if !c.required_models().is_empty() {
                     f.push(field(
                         Download,
@@ -480,6 +521,22 @@ impl Wizard {
                             "downloading..."
                         } else {
                             done("download")
+                        },
+                        Action,
+                    ));
+                }
+                if !c.stack_slots().is_empty() {
+                    f.push(field(
+                        StartStack,
+                        "Start the compose stack",
+                        if self.is_busy("stack") {
+                            "starting..."
+                        } else if self.facts.compose_file.is_none() {
+                            "compose files not found"
+                        } else if self.stack_confirm {
+                            "press Enter again to run it"
+                        } else {
+                            done("stack")
                         },
                         Action,
                     ));
@@ -583,7 +640,83 @@ impl Wizard {
     }
 
     fn options_for_whisper() -> Vec<&'static str> {
-        catalogue::whisper_entries().map(|e| e.id).collect()
+        catalogue::CATALOGUE.iter().map(|e| e.id).collect()
+    }
+
+    /// Servers detected for `slot`.
+    pub fn detected_for(&self, slot: Slot) -> Vec<&DetectedServer> {
+        self.detected.iter().filter(|d| d.slot == slot).collect()
+    }
+
+    fn push_detected(&self, f: &mut Vec<Field>, slot: Slot) {
+        let found = self.detected_for(slot);
+        let shown = match found.get(self.detected_idx[slot_index(slot)]) {
+            Some(d) => format!("{} at {}", d.label, d.base_url),
+            None if self.detect_done => "none found".to_string(),
+            None => "looking...".to_string(),
+        };
+        f.push(field(
+            FieldId::DetectedSel,
+            "Detected server",
+            shown,
+            FieldKind::Choice,
+        ));
+        f.push(field(
+            FieldId::Redetect,
+            "Detect again",
+            "",
+            FieldKind::Action,
+        ));
+    }
+
+    /// The compose command the current choices describe, if the stack is used
+    /// and `compose.yml` was found.
+    pub fn stack_command(&self) -> Option<ComposeCommand> {
+        let stack = self.choices.stack()?;
+        let file = self.facts.compose_file.as_ref()?;
+        Some(ComposeCommand::new(
+            &stack,
+            &self.choices.models_dir,
+            &self.choices.stack_slots(),
+            file,
+            self.facts.home.as_deref(),
+            self.facts.groups.as_deref(),
+        ))
+    }
+
+    /// Reasons the stack command is likely to misbehave, shown before the
+    /// operator confirms it.
+    pub fn stack_warnings(&self) -> Vec<String> {
+        let c = &self.choices;
+        let arch = self
+            .hw
+            .as_ref()
+            .map_or(std::env::consts::ARCH, |h| h.arch.as_str());
+        let mut v = Vec::new();
+        for s in crate::stack::unavailable(c.profile, &c.stack_slots(), arch) {
+            v.push(format!(
+                "Warning: there is no {arch} image for {}; docker will fail to pull it. Pick another source for the {}.",
+                c.profile.service(s),
+                s.label()
+            ));
+        }
+        if c.llm_source == Source::Compose && !c.models_dir.join(&c.llm_file).is_file() {
+            v.push(format!(
+                "Warning: {} does not exist, so {} would restart in a loop. Put a tool-calling GGUF there first, or leave the concierge model on another source.",
+                c.models_dir.join(&c.llm_file).display(),
+                c.profile.service(Slot::Llm)
+            ));
+        }
+        v
+    }
+
+    fn page_slot(&self) -> Option<Slot> {
+        match self.step {
+            Step::Speech => Some(Slot::Stt),
+            Step::Llm => Some(Slot::Llm),
+            Step::Voice => Some(Slot::Tts),
+            _ => None,
+        }
     }
 
     fn cycle_field(&mut self, id: FieldId, dir: i32) {
@@ -593,9 +726,17 @@ impl Wizard {
                 let t = cycle(&super::choices::Tier::ALL, self.choices.tier, dir);
                 self.apply_tier(t);
             }
-            SttKindSel => {
-                self.choices.stt_kind =
-                    cycle(super::choices::SttKind::ALL, self.choices.stt_kind, dir)
+            SttSourceSel => {
+                self.choices.stt_source = cycle(Source::ALL, self.choices.stt_source, dir);
+                self.passed.retain(|p| *p != "stack");
+            }
+            ProfileSel => {
+                self.choices.profile = cycle(
+                    &crate::stack::ComposeProfile::ALL,
+                    self.choices.profile,
+                    dir,
+                );
+                self.passed.retain(|p| *p != "stack");
             }
             WhisperModel => {
                 let ids = Self::options_for_whisper();
@@ -605,23 +746,27 @@ impl Wizard {
                     .unwrap_or(0) as i32;
                 self.choices.whisper_model =
                     ids[(cur + dir).rem_euclid(ids.len() as i32) as usize].to_string();
-                self.choices.whisper_path_override = None;
+                self.choices.whisper_override = None;
+                self.passed.retain(|p| *p != "download");
             }
-            LlmKindSel => {
-                self.choices.llm_kind =
-                    cycle(super::choices::LlmKind::ALL, self.choices.llm_kind, dir);
+            LlmSourceSel => {
+                self.choices.llm_source = cycle(Source::ALL, self.choices.llm_source, dir);
                 self.tool = None;
-                self.passed.retain(|p| *p != "tool");
+                self.passed.retain(|p| *p != "tool" && *p != "stack");
             }
-            LlmDetected if !self.detected.is_empty() => {
-                self.detected_idx = (self.detected_idx as i32 + dir)
-                    .rem_euclid(self.detected.len() as i32)
-                    as usize;
-                self.apply_detected();
+            DetectedSel => {
+                if let Some(slot) = self.page_slot() {
+                    let n = self.detected_for(slot).len();
+                    if n > 0 {
+                        let i = &mut self.detected_idx[slot_index(slot)];
+                        *i = (*i as i32 + dir).rem_euclid(n as i32) as usize;
+                        self.apply_detected(slot);
+                    }
+                }
             }
-            TtsKindSel => {
-                self.choices.tts_kind =
-                    cycle(super::choices::TtsKind::ALL, self.choices.tts_kind, dir)
+            TtsSourceSel => {
+                self.choices.tts_source = cycle(Source::ALL, self.choices.tts_source, dir);
+                self.passed.retain(|p| *p != "stack");
             }
             InputDevice | OutputDevice => {
                 let Some(Ok(list)) = &self.devices else {
@@ -642,14 +787,28 @@ impl Wizard {
         }
     }
 
-    fn apply_detected(&mut self) {
-        if let Some(d) = self.detected.get(self.detected_idx) {
-            self.choices.llm_url = d.base_url.clone();
-            if let Some(m) = d.models.first() {
-                self.choices.llm_model = m.clone();
+    fn apply_detected(&mut self, slot: Slot) {
+        let Some(d) = self
+            .detected_for(slot)
+            .get(self.detected_idx[slot_index(slot)])
+            .map(|d| (*d).clone())
+        else {
+            return;
+        };
+        match slot {
+            Slot::Llm => {
+                self.choices.llm_url = d.base_url;
+                if let Some(m) = d.models.first() {
+                    self.choices.llm_model = m.clone();
+                }
+                self.tool = None;
+                self.passed.retain(|p| *p != "tool");
             }
-            self.tool = None;
-            self.passed.retain(|p| *p != "tool");
+            Slot::Stt => self.choices.stt_url = d.base_url,
+            Slot::Tts => self.choices.tts_url = d.base_url,
+        }
+        if let Some(n) = d.note {
+            self.notes = vec![n];
         }
     }
 
@@ -661,10 +820,11 @@ impl Wizard {
             SttModel => c.stt_model = s,
             LlmUrl => c.llm_url = s,
             LlmModel => c.llm_model = s,
-            KokoroVoice => c.kokoro_voice = s,
+            LlmFile => c.llm_file = s,
             TtsUrl => c.tts_url = s,
             TtsModel => c.tts_model = s,
             TtsVoice => c.tts_voice = s,
+            PocketVoice => c.pocket_voice = s,
             HotkeyAccel => c.hotkey_accel = s,
             MaxUtterance => {
                 if let Ok(v) = s.parse::<u32>() {
@@ -696,16 +856,17 @@ impl Wizard {
             }
             Redetect => {
                 self.detect_done = false;
+                self.detected.clear();
                 self.enter_effects()
             }
             ToolProbeRun if !self.is_busy("tool") => {
                 self.mark_busy("tool");
                 self.tool = None;
                 self.notes.clear();
-                let (base_url, extra) = match self.choices.llm_kind {
-                    LlmKind::Local => (self.choices.llm_url.clone(), Map::new()),
-                    LlmKind::Compose => (super::choices::COMPOSE_LLM.to_string(), Map::new()),
-                    LlmKind::Loom => {
+                let (base_url, extra) = match self.choices.llm_source {
+                    Source::Local => (self.choices.llm_url.clone(), Map::new()),
+                    Source::Compose => (super::choices::COMPOSE_LLM.to_string(), Map::new()),
+                    Source::Remote => {
                         self.notes.push("The Loom is behind an ssh forward that only exists while connected; probing it needs the forward up, so this may fail until `voicelink connect`.".into());
                         (super::choices::loom_url(), super::choices::loom_extra())
                     }
@@ -721,6 +882,28 @@ impl Wizard {
                 self.mark_busy("download");
                 self.notes.clear();
                 vec![Effect::Download(need, self.choices.models_dir.clone())]
+            }
+            StartStack if !self.is_busy("stack") => {
+                self.notes.clear();
+                let Some(cmd) = self.stack_command() else {
+                    self.notes.push(
+                        "compose/compose.yml was not found next to the binary or in the current directory. It ships in the release tarball (compose/); set VOICELINK_COMPOSE to its path."
+                            .into(),
+                    );
+                    return Vec::new();
+                };
+                if !self.stack_confirm {
+                    self.stack_confirm = true;
+                    self.notes.extend(self.stack_warnings());
+                    self.notes.push("This will run:".into());
+                    self.notes.push(cmd.display());
+                    self.notes
+                        .push("Press Enter again to run it; any other key cancels.".into());
+                    return Vec::new();
+                }
+                self.stack_confirm = false;
+                self.mark_busy("stack");
+                vec![Effect::StartStack(Box::new(cmd))]
             }
             Meter => {
                 if self.meter_on {
@@ -808,6 +991,13 @@ impl Wizard {
         }
         let fields = self.fields();
         let n = fields.len().max(1);
+        if !(key == Key::Enter
+            && fields
+                .get(self.cursor)
+                .is_some_and(|f| f.id == FieldId::StartStack))
+        {
+            self.stack_confirm = false;
+        }
         match key {
             Key::CtrlC | Key::Char('q') => return self.quit(),
             Key::Up => self.cursor = (self.cursor + n - 1) % n,
@@ -865,6 +1055,8 @@ impl Wizard {
                 let p = hw.propose();
                 if !self.prefilled {
                     self.apply_tier(p.tier);
+                    self.choices.profile = p.profile;
+                    self.choices.apply_arch(&hw.arch);
                 }
                 self.proposal = Some(p);
                 self.hw = Some(hw);
@@ -873,10 +1065,29 @@ impl Wizard {
                 self.clear_busy("detect");
                 self.detect_done = true;
                 self.detected = list;
-                self.detected_idx = 0;
-                let default_url = self.choices.llm_url == super::choices::LOCAL_LLM;
-                if self.choices.llm_kind == LlmKind::Local && (default_url || !self.prefilled) {
-                    self.apply_detected();
+                self.detected_idx = [0; 3];
+                let c = &self.choices;
+                let defaults = [
+                    (
+                        Slot::Stt,
+                        c.stt_source,
+                        c.stt_url == super::choices::LOCAL_STT,
+                    ),
+                    (
+                        Slot::Llm,
+                        c.llm_source,
+                        c.llm_url == super::choices::LOCAL_LLM,
+                    ),
+                    (
+                        Slot::Tts,
+                        c.tts_source,
+                        c.tts_url == super::choices::LOCAL_TTS,
+                    ),
+                ];
+                for (slot, source, default_url) in defaults {
+                    if source == Source::Local && (default_url || !self.prefilled) {
+                        self.apply_detected(slot);
+                    }
                 }
             }
             Outcome::Tool(t) => {
@@ -929,9 +1140,9 @@ impl Wizard {
                 "ssh: {}   view session: {}",
                 c.ssh_destination, cfg.connection.view_session
             ),
-            format!("stt: {}", c.stt_kind.label()),
-            format!("llm: {} ({})", c.llm_kind.label(), c.llm_model),
-            format!("tts: {}", c.tts_kind.label()),
+            format!("stt: {}", c.stt_source.label(Slot::Stt)),
+            format!("llm: {} ({})", c.llm_source.label(Slot::Llm), c.llm_model),
+            format!("tts: {}", c.tts_source.label(Slot::Tts)),
             format!(
                 "hotkey: {}",
                 if c.hotkey_enabled {
@@ -942,6 +1153,14 @@ impl Wizard {
             ),
             format!("models: {}", c.models_dir.display()),
         ];
+        if let Some(stack) = &cfg.stack {
+            v.push(format!(
+                "compose profile: {} (whisper {}, GGUF {})",
+                stack.profile.name(),
+                stack.whisper_file,
+                stack.llm_file
+            ));
+        }
         for f in &cfg.connection.forwards {
             v.push(format!(
                 "forward {}: 127.0.0.1:{} -> {}",
@@ -964,13 +1183,18 @@ impl Wizard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    const ALL_ENGINES: Engines = Engines {
-        whisper: true,
-        kokoro: true,
-    };
+    use crate::stack::ComposeProfile;
 
     fn wiz() -> Wizard {
-        Wizard::with_engines(None, "laptop", ALL_ENGINES)
+        Wizard::new(None, "laptop")
+    }
+
+    fn facts() -> HostFacts {
+        HostFacts {
+            compose_file: Some("/opt/vl/compose/compose.yml".into()),
+            home: Some("/home/me".into()),
+            groups: None,
+        }
     }
 
     fn strix() -> HardwareReport {
@@ -1002,6 +1226,8 @@ mod tests {
         w.apply(Outcome::Hardware(strix()));
         assert_eq!(w.choices.tier, Tier::RocmLarge);
         assert_eq!(w.choices.whisper_model, "whisper-large-v3-turbo");
+        // Strix Halo (gfx1151) proposes the Vulkan profile, not rocm.
+        assert_eq!(w.choices.profile, ComposeProfile::Vulkan);
         assert!(
             w.proposal
                 .as_ref()
@@ -1014,17 +1240,9 @@ mod tests {
 
     #[test]
     fn prefilled_wizard_keeps_existing_choices() {
-        let mut cfg = Choices::defaults_with(
-            crate::setup::choices::Engines {
-                whisper: true,
-                kokoro: true,
-            },
-            Tier::Cpu,
-            "x",
-        )
-        .to_config();
+        let mut cfg = Choices::defaults_for(Tier::Cpu, "x").to_config();
         cfg.connection.ssh_destination = "me@tail.net".into();
-        let mut w = Wizard::with_engines(Some(&cfg), "laptop", ALL_ENGINES);
+        let mut w = Wizard::new(Some(&cfg), "laptop");
         w.start();
         w.apply(Outcome::Hardware(strix()));
         assert_eq!(w.choices.ssh_destination, "me@tail.net");
@@ -1063,8 +1281,12 @@ mod tests {
         let mut w = wiz();
         w.start();
         w.apply(Outcome::Hardware(HardwareReport::default()));
-        let e = w.goto(Step::Llm);
-        assert!(matches!(e.as_slice(), [Effect::DetectLlm]));
+        let e = w.goto(Step::Speech);
+        assert!(matches!(e.as_slice(), [Effect::Detect]));
+        assert!(
+            w.goto(Step::Llm).is_empty(),
+            "one detection serves all three pages"
+        );
         let e = w.goto(Step::Audio);
         assert!(matches!(e.as_slice(), [Effect::ListDevices]));
         w.meter_on = true;
@@ -1117,23 +1339,53 @@ mod tests {
         assert!(w.notes.iter().any(|n| n.contains("ssh destination")));
     }
 
+    fn detected() -> Vec<DetectedServer> {
+        let s =
+            |slot, label: &str, url: &str, models: &[&str], note: Option<&str>| DetectedServer {
+                slot,
+                label: label.into(),
+                base_url: url.into(),
+                models: models.iter().map(|m| m.to_string()).collect(),
+                note: note.map(String::from),
+            };
+        vec![
+            s(
+                Slot::Llm,
+                "llama-server",
+                "http://127.0.0.1:8080/v1",
+                &["qwen"],
+                None,
+            ),
+            s(
+                Slot::Llm,
+                "Ollama",
+                "http://127.0.0.1:11434/v1",
+                &["llama3"],
+                None,
+            ),
+            s(
+                Slot::Stt,
+                "whisper-server",
+                "http://127.0.0.1:8080/v1",
+                &[],
+                Some("needs --inference-path /v1/audio/transcriptions"),
+            ),
+            s(
+                Slot::Tts,
+                "Kokoro-FastAPI",
+                "http://127.0.0.1:8880/v1",
+                &["kokoro"],
+                None,
+            ),
+        ]
+    }
+
     #[test]
     fn llm_detection_prefills_and_tool_probe_warns() {
         let mut w = wiz();
-        w.choices.llm_kind = LlmKind::Local;
+        w.choices.llm_source = Source::Local;
         w.goto(Step::Llm);
-        w.apply(Outcome::Detected(vec![
-            DetectedServer {
-                label: "llama-server".into(),
-                base_url: "http://127.0.0.1:8080/v1".into(),
-                models: vec!["qwen".into()],
-            },
-            DetectedServer {
-                label: "Ollama".into(),
-                base_url: "http://127.0.0.1:11434/v1".into(),
-                models: vec!["llama3".into()],
-            },
-        ]));
+        w.apply(Outcome::Detected(detected()));
         assert_eq!(w.choices.llm_model, "qwen");
         // Row 1 is the detected-server chooser.
         press(&mut w, &[Key::Down, Key::Right]);
@@ -1159,9 +1411,37 @@ mod tests {
     }
 
     #[test]
+    fn stt_and_tts_detection_is_per_slot_and_carries_notes() {
+        let mut w = wiz();
+        w.choices.stt_source = Source::Local;
+        w.choices.tts_source = Source::Local;
+        w.goto(Step::Speech);
+        w.apply(Outcome::Detected(detected()));
+        assert_eq!(w.choices.stt_url, "http://127.0.0.1:8080/v1");
+        assert_eq!(w.detected_for(Slot::Stt).len(), 1);
+        assert_eq!(w.detected_for(Slot::Llm).len(), 2);
+        // Applying the whisper-server surfaces its --inference-path requirement.
+        w.notes.clear();
+        press(&mut w, &[Key::Down, Key::Right]);
+        assert!(
+            w.notes.iter().any(|n| n.contains("--inference-path")),
+            "{:?}",
+            w.notes
+        );
+        w.goto(Step::Voice);
+        assert_eq!(w.choices.tts_url, "http://127.0.0.1:8880/v1");
+        let shown = w
+            .fields()
+            .into_iter()
+            .find(|f| f.id == FieldId::DetectedSel)
+            .unwrap();
+        assert!(shown.value.contains("Kokoro-FastAPI"));
+    }
+
+    #[test]
     fn loom_probe_uses_forward_url_and_extra() {
         let mut w = wiz();
-        w.choices.llm_kind = LlmKind::Loom;
+        w.choices.llm_source = Source::Remote;
         w.goto(Step::Llm);
         let idx = w
             .fields()
@@ -1180,6 +1460,133 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    fn stack_row(w: &Wizard) -> usize {
+        w.fields()
+            .iter()
+            .position(|f| f.id == FieldId::StartStack)
+            .unwrap()
+    }
+
+    #[test]
+    fn the_stack_only_starts_after_a_second_explicit_enter() {
+        let mut w = wiz();
+        w.facts = facts();
+        w.apply(Outcome::Hardware(HardwareReport {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            ram_mib: 64 * 1024,
+            nvidia: vec![("RTX 4090".into(), 24_564)],
+            ..Default::default()
+        }));
+        assert_eq!(w.choices.profile, ComposeProfile::Cuda);
+        w.goto(Step::Models);
+        w.cursor = stack_row(&w);
+        // First Enter only shows the exact command.
+        assert!(w.key(Key::Enter).is_empty());
+        assert!(w.stack_confirm);
+        assert!(
+            w.notes.iter().any(|n| n
+                == "docker compose -f /opt/vl/compose/compose.yml --profile cuda up -d llm-cuda stt-cuda tts-cuda"
+                || n.ends_with("--profile cuda up -d llm-cuda stt-cuda tts-cuda")),
+            "{:?}",
+            w.notes
+        );
+        // Any other key cancels the pending confirmation.
+        w.key(Key::Down);
+        w.key(Key::Up);
+        assert!(!w.stack_confirm);
+        assert!(w.key(Key::Enter).is_empty(), "back to asking again");
+        // Second Enter on the same row runs it, once.
+        match w.key(Key::Enter).as_slice() {
+            [Effect::StartStack(cmd)] => {
+                assert_eq!(cmd.profile, ComposeProfile::Cuda);
+                assert_eq!(cmd.services, ["llm-cuda", "stt-cuda", "tts-cuda"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(w.key(Key::Enter).is_empty(), "no second concurrent start");
+        w.apply(Outcome::Lines {
+            what: "stack",
+            ok: true,
+            lines: vec!["started".into()],
+        });
+        assert!(w.passed.contains(&"stack"));
+    }
+
+    #[test]
+    fn an_aarch64_host_does_not_get_a_whisper_stack_proposal() {
+        let mut w = wiz();
+        w.apply(Outcome::Hardware(HardwareReport {
+            os: "linux".into(),
+            arch: "aarch64".into(),
+            ram_mib: 32 * 1024,
+            vulkan: vec![("Mali".into(), "INTEGRATED_GPU".into())],
+            ..Default::default()
+        }));
+        assert_eq!(w.choices.tier, Tier::SmallGpu);
+        assert_eq!(
+            w.choices.stt_source,
+            Source::Remote,
+            "no arm64 whisper image"
+        );
+        assert_eq!(w.choices.llm_source, Source::Compose);
+        assert!(
+            w.proposal
+                .as_ref()
+                .unwrap()
+                .evidence
+                .iter()
+                .any(|l| l.contains("aarch64") && l.contains("stt-vulkan"))
+        );
+        // Choosing the stack for speech anyway is warned about before confirmation.
+        w.choices.stt_source = Source::Compose;
+        let warnings = w.stack_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|m| m.contains("no aarch64 image for stt-vulkan")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_gguf_is_warned_about_before_the_stack_starts() {
+        let mut w = wiz();
+        w.facts = facts();
+        w.choices.apply_tier(Tier::Nvidia, "laptop");
+        w.choices.models_dir = "/nonexistent/vl-models".into();
+        w.goto(Step::Models);
+        w.cursor = stack_row(&w);
+        assert!(w.key(Key::Enter).is_empty());
+        assert!(
+            w.notes
+                .iter()
+                .any(|n| n.contains("llm.gguf does not exist") && n.contains("llm-cuda")),
+            "{:?}",
+            w.notes
+        );
+    }
+
+    #[test]
+    fn leaving_the_page_cancels_a_pending_start_and_missing_files_explain() {
+        let mut w = wiz();
+        w.facts = facts();
+        w.choices.apply_tier(Tier::Nvidia, "laptop");
+        w.goto(Step::Models);
+        w.cursor = stack_row(&w);
+        w.key(Key::Enter);
+        assert!(w.stack_confirm);
+        w.key(Key::Char('n'));
+        w.goto(Step::Models);
+        assert!(!w.stack_confirm);
+        // Without compose.yml the wizard says where it belongs, and runs nothing.
+        w.facts = HostFacts::default();
+        w.cursor = stack_row(&w);
+        assert_eq!(w.fields()[w.cursor].value, "compose files not found");
+        assert!(w.key(Key::Enter).is_empty());
+        assert!(w.notes.iter().any(|n| n.contains("VOICELINK_COMPOSE")));
     }
 
     #[test]
@@ -1239,13 +1646,16 @@ mod tests {
         let mut w = wiz();
         w.apply(Outcome::Hardware(strix()));
         w.goto(Step::Models);
+        let ids: Vec<_> = w.fields().iter().map(|f| f.id).collect();
+        assert_eq!(
+            ids,
+            [FieldId::ProfileSel, FieldId::Download, FieldId::StartStack]
+        );
+        w.cursor = 1;
         match w.key(Key::Enter).as_slice() {
             [Effect::Download(entries, _)] => {
                 let ids: Vec<_> = entries.iter().map(|e| e.id).collect();
-                assert_eq!(
-                    ids,
-                    vec!["whisper-large-v3-turbo", "kokoro-model", "kokoro-voices"]
-                );
+                assert_eq!(ids, vec!["whisper-large-v3-turbo"]);
             }
             other => panic!("{other:?}"),
         }

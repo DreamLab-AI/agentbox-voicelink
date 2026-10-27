@@ -285,8 +285,38 @@ fn load_or_setup() -> anyhow::Result<Option<Config>> {
     setup::store::load(&path).map(Some)
 }
 
+/// Flags of `voicelink connect`.
+#[derive(Debug, Clone, Copy, Default, clap::Args)]
+pub struct ConnectArgs {
+    /// Attach even when a configured model endpoint is unreachable.
+    #[arg(long)]
+    pub skip_health: bool,
+}
+
+/// Probes every configured backend through the ssh forwards. `Ok(())` when all
+/// answer, otherwise the printable message.
+fn health_gate(cfg: &Config) -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            format!(
+                "voicelink: cannot start the health check ({e}); use --skip-health to attach anyway"
+            )
+        })?;
+    let failures = rt.block_on(crate::health::check(cfg));
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(crate::health::report(
+        cfg,
+        &failures,
+        crate::stack::locate().as_deref(),
+    ))
+}
+
 /// Attaches the terminal and starts the daemon.
-pub fn run() -> anyhow::Result<()> {
+pub fn run(args: ConnectArgs) -> anyhow::Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("`voicelink connect` needs an interactive terminal");
     }
@@ -323,6 +353,15 @@ pub fn run() -> anyhow::Result<()> {
         sock: sock.clone(),
         daemon: None,
     };
+    // The forwards are up, so remote services are reachable too. Nothing has
+    // been handed to tmux yet; dropping `link` closes the master again.
+    if !args.skip_health
+        && let Err(msg) = health_gate(&cfg)
+    {
+        drop(link);
+        eprintln!("{msg}");
+        bail!("model endpoints unreachable");
+    }
     link.spawn_daemon()?;
 
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());

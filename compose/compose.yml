@@ -1,19 +1,28 @@
-# Optional local inference stack for voicelink: OpenAI-compatible servers that
-# reach ROCm, CUDA or Vulkan through containers, so the voicelink binary itself
-# never links a vendor GPU runtime (I3) and the LLM stays an HTTP server (I4).
+# Optional local inference stack for voicelink: OpenAI-compatible model servers
+# in containers. voicelink reaches every model over HTTP, so GPU runtimes (ROCm,
+# CUDA, Vulkan) live in these images and never in the client binary.
 #
 #   docker compose -f compose/compose.yml --profile vulkan up -d
 #
 # Pick exactly ONE profile (rocm | cuda | vulkan | cpu); they publish the same
-# loopback ports. Everything binds to 127.0.0.1 only.
+# loopback ports. `voicelink setup` prints the exact command for your choices,
+# including the service names, so a slot you serve elsewhere is not started.
 #
 #   llm   127.0.0.1:8180/v1   llama.cpp server, started with --jinja (tool calls)
 #   stt   127.0.0.1:8181/v1   whisper.cpp whisper-server on /v1/audio/transcriptions
-#   tts   127.0.0.1:8182/v1   Kokoro-FastAPI on /v1/audio/speech
+#   tts   127.0.0.1:8182/v1   Kokoro-FastAPI on /v1/audio/speech (weights in the image)
 #
-# Image tags were checked against the registries on 2026-10-27. The llama.cpp
-# tags are floating (they track master); pin one with LLAMA_TAG_* once you
-# have a build you like.
+# Every image is pinned to the immutable digest of its multi-arch index; the tag
+# is kept for readability only. Resolved from the registry on 2026-10-27:
+#   ghcr.io/ggml-org/llama.cpp   server-* = llama.cpp build b11913 (revision 7aca0d2)
+#   ghcr.io/ggml-org/whisper.cpp main, main-vulkan, main-cuda
+#   ghcr.io/remsky/kokoro-fastapi-{cpu,gpu}   v0.9.0, v0.9.0-cu128
+# To move to newer builds, resolve the new digests (see compose/README.md) and
+# edit them here: there is deliberately no tag override, because a digest wins
+# over a tag and an override would only pretend to work.
+#
+# One models directory is shared with the wizard: `voicelink setup` downloads
+# the whisper model into the same directory it passes as VOICELINK_MODELS_DIR.
 name: voicelink-inference
 
 x-models: &models
@@ -43,8 +52,34 @@ x-llm-gpu: &llm-gpu
   - --port
   - "8080"
 
+# whisper-server has no GPU or model flags beyond these; the model is a ggml
+# file in the shared models directory.
 x-stt-command: &stt-command
   - whisper-server --host 0.0.0.0 --port 8080 --model /models/${WHISPER_MODEL_FILE:-ggml-base.en-q8_0.bin} --inference-path /v1/audio/transcriptions
+
+# Every image installs curl. llama-server and whisper-server answer /health
+# (503 or "loading model" until the model is in memory); Kokoro-FastAPI answers
+# /health once its model is loaded.
+x-health-llm: &health-llm
+  test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+  interval: 15s
+  timeout: 5s
+  retries: 8
+  start_period: 180s
+
+x-health-stt: &health-stt
+  test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+  interval: 15s
+  timeout: 5s
+  retries: 8
+  start_period: 60s
+
+x-health-tts: &health-tts
+  test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8880/health"]
+  interval: 15s
+  timeout: 5s
+  retries: 8
+  start_period: 120s
 
 x-nvidia: &nvidia
   resources:
@@ -58,89 +93,100 @@ services:
   # ------------------------------------------------------------------ LLM
   llm-rocm:
     profiles: [rocm]
-    image: ghcr.io/ggml-org/llama.cpp:${LLAMA_TAG_ROCM:-server-rocm}
+    image: ghcr.io/ggml-org/llama.cpp:server-rocm@sha256:31b19613c7ae55048dd113a3f4e7d093308eb9b2370a02d4d06782102bd6ea2c
     command: *llm-gpu
     devices: [/dev/kfd, /dev/dri]
     group_add: ["${VIDEO_GID:-44}", "${RENDER_GID:-992}"]
     security_opt: [seccomp=unconfined]
     ports: ["127.0.0.1:8180:8080"]
     volumes: *models
+    healthcheck: *health-llm
     restart: unless-stopped
 
   llm-cuda:
     profiles: [cuda]
-    image: ghcr.io/ggml-org/llama.cpp:${LLAMA_TAG_CUDA:-server-cuda}
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:8c219fe0367f7e794e3c69da50c5992d474077d60794a218b9e9a3b0c5aed688
     command: *llm-gpu
     deploy: *nvidia
     ports: ["127.0.0.1:8180:8080"]
     volumes: *models
+    healthcheck: *health-llm
     restart: unless-stopped
 
   llm-vulkan:
     profiles: [vulkan]
-    image: ghcr.io/ggml-org/llama.cpp:${LLAMA_TAG_VULKAN:-server-vulkan}
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan@sha256:3607a208ef03bc4f64515fbfac6bffc386859c14b64abec24c96f143868fcb37
     command: *llm-gpu
     devices: [/dev/dri]
     group_add: ["${VIDEO_GID:-44}", "${RENDER_GID:-992}"]
     ports: ["127.0.0.1:8180:8080"]
     volumes: *models
+    healthcheck: *health-llm
     restart: unless-stopped
 
   llm-cpu:
     profiles: [cpu]
-    image: ghcr.io/ggml-org/llama.cpp:${LLAMA_TAG_CPU:-server}
+    image: ghcr.io/ggml-org/llama.cpp:server@sha256:8ee4ec7ce58a921313d07390c6699af13aa5ec083f3cdf67e5f4155767047373
     command: *llm-base
     ports: ["127.0.0.1:8180:8080"]
     volumes: *models
+    healthcheck: *health-llm
     restart: unless-stopped
 
   # ------------------------------------------------------------------ STT
   # whisper.cpp publishes no server image; its `main*` images carry
-  # whisper-server, so it is started through `bash -c`. Models are the ggml
-  # files `voicelink setup` downloads into the models directory.
+  # whisper-server (confirmed in the image layers: /app/build/bin/ in main and
+  # main-cuda, /usr/local/bin/ in main-vulkan), so it is started through
+  # `bash -c`. main-vulkan sets no entrypoint, hence the explicit one here.
   stt-cuda:
     profiles: [cuda]
-    image: ghcr.io/ggml-org/whisper.cpp:${WHISPER_TAG_CUDA:-main-cuda}
+    image: ghcr.io/ggml-org/whisper.cpp:main-cuda@sha256:b0d3a90a4db2f975391614c65e53f2ecf63f28dbfe1329ea53b5154af8bd42ed
     entrypoint: [bash, -c]
     command: *stt-command
     deploy: *nvidia
     ports: ["127.0.0.1:8181:8080"]
     volumes: *models
+    healthcheck: *health-stt
     restart: unless-stopped
 
-  # ROCm hosts use the Vulkan build of whisper.cpp (RADV); there is no ROCm image.
+  # ROCm hosts use the Vulkan build of whisper.cpp (Mesa RADV); there is no ROCm image.
   stt-vulkan:
     profiles: [vulkan, rocm]
-    image: ghcr.io/ggml-org/whisper.cpp:${WHISPER_TAG_VULKAN:-main-vulkan}
+    image: ghcr.io/ggml-org/whisper.cpp:main-vulkan@sha256:a1d539e66d62a0e9d655237b94bc0e91cad5fbcb54c2bfb57d9b830e7fec378f
     entrypoint: [bash, -c]
     command: *stt-command
     devices: [/dev/dri]
     group_add: ["${VIDEO_GID:-44}", "${RENDER_GID:-992}"]
     ports: ["127.0.0.1:8181:8080"]
     volumes: *models
+    healthcheck: *health-stt
     restart: unless-stopped
 
   stt-cpu:
     profiles: [cpu]
-    image: ghcr.io/ggml-org/whisper.cpp:${WHISPER_TAG_CPU:-main}
+    image: ghcr.io/ggml-org/whisper.cpp:main@sha256:cdfceef9caa5fed3efaf07bfc7d1ea0e43d28536e1521f448570b0ab02886abb
     entrypoint: [bash, -c]
     command: *stt-command
     ports: ["127.0.0.1:8181:8080"]
     volumes: *models
+    healthcheck: *health-stt
     restart: unless-stopped
 
   # ------------------------------------------------------------------ TTS
-  # Kokoro-FastAPI bundles the Kokoro-82M weights in the image. Its GPU image
-  # is CUDA only; every other profile uses the CPU image.
+  # Kokoro-FastAPI downloads the Kokoro-82M weights while the image is built, so
+  # it needs no model files from the shared directory. Its GPU image is CUDA only;
+  # every other profile uses the CPU image.
   tts-cuda:
     profiles: [cuda]
-    image: ghcr.io/remsky/kokoro-fastapi-gpu:${KOKORO_TAG_GPU:-v0.9.0-cu128}
+    image: ghcr.io/remsky/kokoro-fastapi-gpu:v0.9.0-cu128@sha256:c6683ee24a3b3bc3b49130ecc52c32e8010a1052ae32781a91682fa09c6ba984
     deploy: *nvidia
     ports: ["127.0.0.1:8182:8880"]
+    healthcheck: *health-tts
     restart: unless-stopped
 
   tts-cpu:
     profiles: [cpu, vulkan, rocm]
-    image: ghcr.io/remsky/kokoro-fastapi-cpu:${KOKORO_TAG_CPU:-v0.9.0}
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:v0.9.0@sha256:ee3111d6a2c903ed62f3b4fa19543c6901205ed39fce3c177e895b34a8386b9c
     ports: ["127.0.0.1:8182:8880"]
+    healthcheck: *health-tts
     restart: unless-stopped

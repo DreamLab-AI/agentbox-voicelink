@@ -9,7 +9,7 @@ use axum::{
     },
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use serde_json::{Value, json};
 use std::{
@@ -522,6 +522,12 @@ async fn nemotron_error_and_unreachable() {
         matches!(&e, BackendError::Backend(m) if m.contains("another stream")),
         "{e}"
     );
+    // A busy server is still a live one: the probe must not report an outage.
+    voicelink_backends::probe_stt(&SttConfig::Nemotron {
+        url: format!("ws://{addr}/ws"),
+    })
+    .await
+    .unwrap();
     let stt = build_stt(&SttConfig::Nemotron {
         url: "ws://127.0.0.1:1/x".into(),
     })
@@ -534,16 +540,15 @@ async fn nemotron_error_and_unreachable() {
 
 #[test]
 fn factories_reject_bad_configs() {
-    let cfg = |e: Result<Box<dyn voicelink_backends::TextToSpeech>, _>| match e {
-        Err(BackendError::Config(m)) => m,
-        _ => panic!("expected Config error"),
-    };
-    let m = cfg(build_tts(&TtsConfig::Kokoro {
-        model_path: "a".into(),
-        voices_path: "b".into(),
-        voice: "c".into(),
-    }));
-    assert!(m.contains("Kokoro"));
+    assert!(matches!(
+        build_tts(&TtsConfig::OpenAi {
+            base_url: "ftp://x".into(),
+            model: "m".into(),
+            voice: "v".into(),
+            api_key_env: None
+        }),
+        Err(BackendError::Config(m)) if m.contains("http")
+    ));
     assert!(
         build_stt(&SttConfig::Nemotron {
             url: "http://x".into()
@@ -566,11 +571,6 @@ fn factories_reject_bad_configs() {
         })
         .is_err()
     );
-    #[cfg(not(feature = "whisper"))]
-    assert!(matches!(
-        build_stt(&SttConfig::Whisper { model_path: "x".into(), language: None, threads: 1, gpu: false }),
-        Err(BackendError::Config(m)) if m.contains("not compiled in")
-    ));
 }
 
 #[tokio::test]
@@ -589,5 +589,75 @@ async fn nemotron_rejects_utterance_over_limit_without_connecting() {
     match stt.transcribe(&clip).await {
         Err(BackendError::Backend(m)) => assert!(m.contains("exceeds"), "{m}"),
         other => panic!("expected the length guard, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn probe_openai_distinguishes_up_down_and_http_errors() {
+    use voicelink_backends::{probe_llm, probe_stt, probe_tts};
+    let app = Router::new()
+        .route("/ok/v1/models", get(|| async { Json(json!({"data": []})) }))
+        .route(
+            "/denied/v1/models",
+            get(|| async { StatusCode::UNAUTHORIZED }),
+        )
+        .route(
+            "/broken/v1/models",
+            get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+    let host = format!("http://{}", serve(app).await);
+    let stt = |p: &str| SttConfig::OpenAi {
+        base_url: format!("{host}/{p}/v1"),
+        model: "m".into(),
+        api_key_env: None,
+    };
+    probe_stt(&stt("ok")).await.unwrap();
+    // No `/models` route (whisper-server, Pocket): a 404 still proves it is up.
+    probe_stt(&stt("absent")).await.unwrap();
+    for (p, code) in [("denied", "401"), ("broken", "500")] {
+        match probe_stt(&stt(p)).await {
+            Err(BackendError::Backend(m)) => {
+                assert!(
+                    m.contains(&format!("{host}/{p}/v1/models")) && m.contains(code),
+                    "{m}"
+                )
+            }
+            other => panic!("expected an HTTP error, got {other:?}"),
+        }
+    }
+    let llm = LlmConfig::OpenAi {
+        base_url: format!("{host}/ok/v1/"),
+        model: "m".into(),
+        api_key_env: None,
+        extra: serde_json::Map::new(),
+    };
+    probe_llm(&llm).await.unwrap();
+    let tts = TtsConfig::OpenAi {
+        base_url: "http://127.0.0.1:1/v1".into(),
+        model: "m".into(),
+        voice: "v".into(),
+        api_key_env: None,
+    };
+    match probe_tts(&tts).await {
+        Err(BackendError::Transport(m)) => {
+            assert!(
+                m.contains("http://127.0.0.1:1/v1/models") && m.contains("refused"),
+                "{m}"
+            )
+        }
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn probe_nemotron_waits_for_ready_and_names_the_url() {
+    use voicelink_backends::probe_stt;
+    let host = serve(Router::new().route("/api/asr-streaming", get(nemotron_ws))).await;
+    let url = format!("ws://{host}/api/asr-streaming");
+    probe_stt(&SttConfig::Nemotron { url }).await.unwrap();
+    let dead = "ws://127.0.0.1:1/api/asr-streaming";
+    match probe_stt(&SttConfig::Nemotron { url: dead.into() }).await {
+        Err(BackendError::Transport(m)) => assert!(m.contains(dead), "{m}"),
+        other => panic!("expected a transport error, got {other:?}"),
     }
 }

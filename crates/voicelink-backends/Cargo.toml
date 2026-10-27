@@ -1,27 +1,17 @@
 [package]
 name = "voicelink-backends"
 version = "0.1.0"
-description = "Interchangeable speech-to-text, tool-calling chat and text-to-speech backends: embedded whisper.cpp and Kokoro, or OpenAI-compatible and Nemotron servers"
+description = "Speech-to-text, tool-calling chat and text-to-speech clients for OpenAI-compatible and Nemotron servers, with reachability probes"
 readme = "README.md"
-keywords = ["speech", "whisper", "tts", "llm", "voice"]
+keywords = ["speech", "stt", "tts", "llm", "openai"]
 categories = ["multimedia::audio", "api-bindings"]
 edition.workspace = true
-rust-version.workspace = true
+# Derived: edition 2024 needs 1.85 and no dependency in the lock file asks for more.
+rust-version = "1.85"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-
-[features]
-default = []
-# Embedded whisper.cpp speech-to-text (CPU).
-whisper = ["dep:whisper-rs", "tokio/rt"]
-# Embedded Kokoro-82M text-to-speech (ONNX Runtime, CPU; permissive G2P, no espeak-ng).
-kokoro = ["dep:ort", "dep:misaki-rs", "dep:zip", "tokio/rt"]
-# Embedded whisper.cpp with the Vulkan GPU backend.
-whisper-vulkan = ["whisper", "whisper-rs/vulkan"]
-# Embedded whisper.cpp with the Metal GPU backend.
-whisper-metal = ["whisper", "whisper-rs/metal"]
 
 [dependencies]
 serde.workspace = true
@@ -34,10 +24,6 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rmp-serde = "1"
 rubato = "0.16"
-whisper-rs = { version = "0.16", optional = true }
-ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = ["std", "download-binaries", "tls-rustls"] }
-misaki-rs = { version = "0.6", optional = true, default-features = false }
-zip = { version = "2", optional = true, default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }

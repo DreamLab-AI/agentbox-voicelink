@@ -1,13 +1,14 @@
 //! The wizard's editable model of a configuration, and its projection to and
 //! from [`Config`].
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::{Map, Value, json};
 use voicelink_backends::{LlmConfig, SttConfig, TtsConfig};
 
 use super::catalogue::{self, Entry};
-use crate::config::{Config, Connection, Forward};
+use crate::config::{Config, Connection, Forward, Slot};
+use crate::stack::{ComposeProfile, DEFAULT_LLM_FILE, DEFAULT_WHISPER_FILE, Stack};
 
 /// Local port of the forward to the agentbox Ontology Loom.
 pub const LOOM_PORT: u16 = 18084;
@@ -19,16 +20,20 @@ pub const NEMOTRON_PORT: u16 = 18897;
 pub const MAX_UTTERANCE_CAP_MS: u32 = 30_000;
 /// Default ssh destination for the agentbox host.
 pub const DEFAULT_SSH: &str = "machinelearn@192.168.2.132";
-/// Base URLs of the optional local compose stack (`compose/compose.yml`).
+/// Base URL of the compose stack's llama.cpp server (`compose/compose.yml`).
 pub const COMPOSE_LLM: &str = "http://127.0.0.1:8180/v1";
-/// Compose whisper server.
+/// Base URL of the compose stack's whisper.cpp server.
 pub const COMPOSE_STT: &str = "http://127.0.0.1:8181/v1";
-/// Compose Kokoro-FastAPI server.
+/// Base URL of the compose stack's Kokoro-FastAPI server.
 pub const COMPOSE_TTS: &str = "http://127.0.0.1:8182/v1";
 /// Where a locally run llama-server listens by default.
 pub const LOCAL_LLM: &str = "http://127.0.0.1:8080/v1";
+/// Where a locally run whisper-server listens by default.
+pub const LOCAL_STT: &str = "http://127.0.0.1:8080/v1";
+/// Where a locally run Kokoro-FastAPI listens by default.
+pub const LOCAL_TTS: &str = "http://127.0.0.1:8880/v1";
 
-/// Hardware class, deciding the default model sizes.
+/// Hardware class, deciding the compose profile and the default model sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Tier {
     /// ROCm with at least 32 GiB unified or dedicated memory.
@@ -40,13 +45,13 @@ pub enum Tier {
     /// Any smaller GPU (Vulkan).
     #[value(name = "small-gpu")]
     SmallGpu,
-    /// Apple silicon (Metal).
+    /// Apple silicon: Docker has no GPU there, so native servers.
     #[value(name = "metal")]
     Metal,
     /// No usable GPU.
     #[value(name = "cpu")]
     Cpu,
-    /// Thin client: speech is remote.
+    /// Thin client: everything is remote.
     #[value(name = "thin")]
     Thin,
 }
@@ -68,7 +73,7 @@ impl Tier {
             Tier::RocmLarge => "rocm-large",
             Tier::Nvidia => "nvidia",
             Tier::SmallGpu => "small-gpu (Vulkan)",
-            Tier::Metal => "metal (Apple silicon)",
+            Tier::Metal => "metal (Apple silicon, native servers)",
             Tier::Cpu => "cpu",
             Tier::Thin => "thin (remote speech)",
         }
@@ -86,70 +91,78 @@ impl Tier {
         })
     }
 
-    /// Whether the embedded engines should use the GPU build (Vulkan or Metal).
-    pub fn gpu(self) -> bool {
-        matches!(
-            self,
-            Tier::RocmLarge | Tier::Nvidia | Tier::SmallGpu | Tier::Metal
-        )
+    /// The compose profile that matches the tier (Metal and thin clients do not
+    /// use the stack by default; the profile is only a starting point there).
+    pub fn profile(self) -> ComposeProfile {
+        match self {
+            Tier::RocmLarge => ComposeProfile::Rocm,
+            Tier::Nvidia => ComposeProfile::Cuda,
+            Tier::SmallGpu => ComposeProfile::Vulkan,
+            Tier::Metal | Tier::Cpu | Tier::Thin => ComposeProfile::Cpu,
+        }
+    }
+
+    /// The tier that a stored compose profile implies.
+    pub fn from_profile(p: ComposeProfile) -> Tier {
+        match p {
+            ComposeProfile::Rocm => Tier::RocmLarge,
+            ComposeProfile::Cuda => Tier::Nvidia,
+            ComposeProfile::Vulkan => Tier::SmallGpu,
+            ComposeProfile::Cpu => Tier::Cpu,
+        }
+    }
+
+    /// Guidance on the concierge model size for the tier. The GGUF itself is
+    /// the operator's choice: it must support tool calls.
+    pub fn llm_hint(self) -> &'static str {
+        match self {
+            Tier::RocmLarge => {
+                "a 27B-35B tool-calling model at Q4 (about 20 GB) fits in unified memory"
+            }
+            Tier::Nvidia => "an 8B-14B tool-calling model at Q4 (6-10 GB)",
+            Tier::SmallGpu => "a 4B-8B tool-calling model at Q4 (3-5 GB)",
+            Tier::Metal => "an 8B-14B tool-calling model through Ollama or LM Studio",
+            Tier::Cpu => "CPU inference is slow: prefer the agentbox Loom, or a 4B model at Q4",
+            Tier::Thin => "the agentbox Loom",
+        }
     }
 }
 
-/// How speech-to-text is provided.
+/// Where one model slot is served from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum SttKind {
-    /// whisper.cpp in-process.
-    #[value(name = "embedded")]
-    Embedded,
-    /// An OpenAI-compatible HTTP server.
-    #[value(name = "http")]
-    Http,
-    /// Remote Nemotron over an ssh forward.
-    #[value(name = "nemotron")]
-    Nemotron,
-}
-
-/// Where the concierge LLM runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum LlmKind {
-    /// A server already running on this machine (llama-server, Ollama, LM Studio).
-    #[value(name = "local")]
-    Local,
-    /// The optional compose stack.
+pub enum Source {
+    /// The bundled Docker compose stack.
     #[value(name = "compose")]
     Compose,
-    /// The agentbox Ontology Loom over an ssh forward.
-    #[value(name = "loom")]
-    Loom,
+    /// A server already running on this machine.
+    #[value(name = "local")]
+    Local,
+    /// An agentbox service over an ssh forward (Nemotron, Pocket TTS, the Loom).
+    #[value(name = "remote")]
+    Remote,
 }
 
-/// How text-to-speech is provided.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum TtsKind {
-    /// Kokoro in-process.
-    #[value(name = "embedded")]
-    Embedded,
-    /// An OpenAI-compatible HTTP server.
-    #[value(name = "http")]
-    Http,
-    /// agentbox Pocket TTS over an ssh forward.
-    #[value(name = "pocket")]
-    Pocket,
-}
+impl Source {
+    /// Every source, in menu order.
+    pub const ALL: &'static [Source] = &[Source::Compose, Source::Local, Source::Remote];
 
-macro_rules! kind_labels {
-    ($t:ty, $($v:path => $l:expr),+) => {
-        impl $t {
-            /// Every variant in menu order.
-            pub const ALL: &'static [$t] = &[$($v),+];
-            /// Menu label.
-            pub fn label(self) -> &'static str { match self { $($v => $l),+ } }
+    /// Menu label for `slot`.
+    pub fn label(self, slot: Slot) -> &'static str {
+        match (self, slot) {
+            (Source::Compose, Slot::Stt) => "compose stack (whisper.cpp server)",
+            (Source::Compose, Slot::Llm) => "compose stack (llama.cpp server)",
+            (Source::Compose, Slot::Tts) => "compose stack (Kokoro-FastAPI)",
+            (Source::Local, Slot::Stt) => "server already running (HTTP)",
+            (Source::Local, Slot::Llm) => {
+                "server already running (llama-server, Ollama, LM Studio)"
+            }
+            (Source::Local, Slot::Tts) => "server already running (HTTP)",
+            (Source::Remote, Slot::Stt) => "agentbox Nemotron (ssh forward)",
+            (Source::Remote, Slot::Llm) => "agentbox Ontology Loom (ssh forward)",
+            (Source::Remote, Slot::Tts) => "agentbox Pocket TTS (ssh forward)",
         }
-    };
+    }
 }
-kind_labels!(SttKind, SttKind::Embedded => "embedded whisper.cpp", SttKind::Http => "HTTP (OpenAI-compatible)", SttKind::Nemotron => "remote Nemotron (ssh forward)");
-kind_labels!(LlmKind, LlmKind::Local => "local server", LlmKind::Compose => "compose stack", LlmKind::Loom => "agentbox Ontology Loom (ssh forward)");
-kind_labels!(TtsKind, TtsKind::Embedded => "embedded Kokoro", TtsKind::Http => "HTTP (OpenAI-compatible)", TtsKind::Pocket => "agentbox Pocket TTS (ssh forward)");
 
 /// Steps through `all` from `current` by `dir` (+1 or -1), wrapping.
 pub fn cycle<T: Copy + PartialEq>(all: &[T], current: T, dir: i32) -> T {
@@ -160,38 +173,40 @@ pub fn cycle<T: Copy + PartialEq>(all: &[T], current: T, dir: i32) -> T {
 /// Everything the wizard edits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Choices {
-    /// Embedded engines the defaults were derived for.
-    pub engines: Engines,
     /// Hardware tier.
     pub tier: Tier,
     /// ssh destination.
     pub ssh_destination: String,
-    /// STT provider.
-    pub stt_kind: SttKind,
-    /// Catalogue id of the embedded whisper model.
+    /// Compose profile for the slots served by the stack.
+    pub profile: ComposeProfile,
+    /// STT source.
+    pub stt_source: Source,
+    /// Catalogue id of the whisper model the stack serves.
     pub whisper_model: String,
-    /// Explicit whisper model path overriding the catalogue (from a hand-edited config).
-    pub whisper_path_override: Option<String>,
-    /// HTTP STT base URL.
+    /// Explicit whisper file overriding the catalogue (from a hand-edited config).
+    pub whisper_override: Option<String>,
+    /// Local STT base URL.
     pub stt_url: String,
-    /// HTTP STT model name.
+    /// STT model name sent in requests.
     pub stt_model: String,
-    /// LLM provider.
-    pub llm_kind: LlmKind,
+    /// LLM source.
+    pub llm_source: Source,
     /// Local LLM base URL.
     pub llm_url: String,
     /// LLM model name.
     pub llm_model: String,
-    /// TTS provider.
-    pub tts_kind: TtsKind,
-    /// HTTP TTS base URL.
+    /// GGUF file (in the models directory) the stack's llama.cpp server loads.
+    pub llm_file: String,
+    /// TTS source.
+    pub tts_source: Source,
+    /// Local TTS base URL.
     pub tts_url: String,
-    /// HTTP TTS model name.
+    /// TTS model name.
     pub tts_model: String,
-    /// TTS voice (HTTP and Pocket).
+    /// TTS voice of a Kokoro server (compose or local).
     pub tts_voice: String,
-    /// Kokoro voice (embedded).
-    pub kokoro_voice: String,
+    /// Voice sent to agentbox Pocket TTS, which has its own voice names.
+    pub pocket_voice: String,
     /// Input device (`None` = system default).
     pub input_device: Option<String>,
     /// Output device (`None` = system default).
@@ -202,41 +217,16 @@ pub struct Choices {
     pub hotkey_accel: String,
     /// Longest utterance passed to STT, in milliseconds (at most [`MAX_UTTERANCE_CAP_MS`]).
     pub max_utterance_ms: u32,
-    /// Where models live.
+    /// Where models live; the compose stack mounts the same directory.
     pub models_dir: PathBuf,
     /// The configuration being edited; fields the wizard does not own pass through.
     base: Config,
 }
 
-/// Embedded engines available in this build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Engines {
-    /// Embedded whisper.cpp speech-to-text.
-    pub whisper: bool,
-    /// Embedded Kokoro text-to-speech.
-    pub kokoro: bool,
-}
-
-impl Engines {
-    /// The engines compiled into this binary.
-    pub fn compiled() -> Self {
-        Engines {
-            whisper: voicelink_backends::EMBEDDED_WHISPER,
-            kokoro: voicelink_backends::EMBEDDED_KOKORO,
-        }
-    }
-}
-
 impl Choices {
     /// Defaults for `tier` on a machine called `client_host`.
     pub fn defaults_for(tier: Tier, client_host: &str) -> Self {
-        Self::defaults_with(Engines::compiled(), tier, client_host)
-    }
-
-    /// As [`Choices::defaults_for`], for an explicit set of embedded engines.
-    pub fn defaults_with(engines: Engines, tier: Tier, client_host: &str) -> Self {
         let models_dir = crate::paths::models_dir().unwrap_or_else(|_| PathBuf::from("models"));
-        let thin = tier == Tier::Thin;
         let base = Config {
             connection: Connection::agentbox(DEFAULT_SSH, client_host),
             audio: Default::default(),
@@ -258,41 +248,30 @@ impl Choices {
                 api_key_env: None,
             },
             models_dir: models_dir.clone(),
+            stack: None,
         };
+        let (stt_source, llm_source, tts_source) = tier_sources(tier);
         Choices {
-            engines,
             tier,
             ssh_destination: DEFAULT_SSH.into(),
-            // Without an embedded engine compiled in, fall back to the agentbox
-            // speech plane, which every agentbox host has.
-            stt_kind: if thin || !engines.whisper {
-                SttKind::Nemotron
-            } else {
-                SttKind::Embedded
-            },
+            profile: tier.profile(),
+            stt_source,
             whisper_model: tier
                 .default_whisper()
                 .unwrap_or("whisper-base-en-q8")
                 .into(),
-            whisper_path_override: None,
-            stt_url: COMPOSE_STT.into(),
+            whisper_override: None,
+            stt_url: LOCAL_STT.into(),
             stt_model: "whisper-1".into(),
-            llm_kind: if matches!(tier, Tier::Cpu | Tier::Thin) {
-                LlmKind::Loom
-            } else {
-                LlmKind::Local
-            },
+            llm_source,
             llm_url: LOCAL_LLM.into(),
             llm_model: "default".into(),
-            tts_kind: if thin || !engines.kokoro {
-                TtsKind::Pocket
-            } else {
-                TtsKind::Embedded
-            },
-            tts_url: COMPOSE_TTS.into(),
+            llm_file: DEFAULT_LLM_FILE.into(),
+            tts_source,
+            tts_url: LOCAL_TTS.into(),
             tts_model: "kokoro".into(),
             tts_voice: "af_heart".into(),
-            kokoro_voice: "af_heart".into(),
+            pocket_voice: "alba".into(),
             input_device: None,
             output_device: None,
             hotkey_enabled: false,
@@ -303,16 +282,36 @@ impl Choices {
         }
     }
 
-    /// Resets the tier-dependent choices (speech providers, whisper size, LLM
-    /// provider) to the defaults of `tier`, keeping everything else.
+    /// Resets the tier-dependent choices (sources, compose profile, whisper
+    /// size) to the defaults of `tier`, keeping everything else.
     pub fn apply_tier(&mut self, tier: Tier, client_host: &str) {
-        let d = Choices::defaults_with(self.engines, tier, client_host);
+        let d = Choices::defaults_for(tier, client_host);
         self.tier = tier;
-        self.stt_kind = d.stt_kind;
+        self.profile = d.profile;
+        self.stt_source = d.stt_source;
+        self.llm_source = d.llm_source;
+        self.tts_source = d.tts_source;
         self.whisper_model = d.whisper_model;
-        self.whisper_path_override = None;
-        self.tts_kind = d.tts_kind;
-        self.llm_kind = d.llm_kind;
+        self.whisper_override = None;
+    }
+
+    /// Moves every stack slot whose image is not published for `arch` to the
+    /// agentbox service, and returns the slots it moved. The whisper.cpp
+    /// images are `linux/amd64` only, so an aarch64 Linux host cannot take
+    /// speech-to-text from the stack.
+    pub fn apply_arch(&mut self, arch: &str) -> Vec<Slot> {
+        if arch.is_empty() {
+            return Vec::new();
+        }
+        let moved = crate::stack::unavailable(self.profile, &self.stack_slots(), arch);
+        for slot in &moved {
+            match slot {
+                Slot::Stt => self.stt_source = Source::Remote,
+                Slot::Llm => self.llm_source = Source::Remote,
+                Slot::Tts => self.tts_source = Source::Remote,
+            }
+        }
+        moved
     }
 
     /// Pre-fills the wizard from an existing configuration.
@@ -326,67 +325,65 @@ impl Choices {
         c.hotkey_accel = cfg.hotkey.mute.clone();
         c.max_utterance_ms = cfg.audio.max_utterance_ms;
         match &cfg.stt {
-            SttConfig::Whisper {
-                model_path, gpu, ..
-            } => {
-                c.stt_kind = SttKind::Embedded;
-                let file = Path::new(model_path)
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .unwrap_or_default();
-                match catalogue::find_by_file(file) {
-                    Some(e) => c.whisper_model = e.id.into(),
-                    None => c.whisper_path_override = Some(model_path.clone()),
-                }
-                c.tier = if *gpu { Tier::SmallGpu } else { Tier::Cpu };
-            }
             SttConfig::OpenAi {
                 base_url, model, ..
             } => {
-                c.stt_kind = SttKind::Http;
+                c.stt_source = if base_url == COMPOSE_STT {
+                    Source::Compose
+                } else {
+                    Source::Local
+                };
                 c.stt_url = base_url.clone();
                 c.stt_model = model.clone();
             }
-            SttConfig::Nemotron { .. } => {
-                c.stt_kind = SttKind::Nemotron;
-                c.tier = Tier::Thin;
-            }
+            SttConfig::Nemotron { .. } => c.stt_source = Source::Remote,
         }
-        #[allow(irrefutable_let_patterns)]
-        if let LlmConfig::OpenAi {
+        let LlmConfig::OpenAi {
             base_url, model, ..
-        } = &cfg.llm
-        {
-            c.llm_model = model.clone();
-            c.llm_url = base_url.clone();
-            c.llm_kind = if *base_url == loom_url() {
-                LlmKind::Loom
-            } else if base_url == COMPOSE_LLM {
-                LlmKind::Compose
-            } else {
-                LlmKind::Local
-            };
+        } = &cfg.llm;
+        c.llm_model = model.clone();
+        c.llm_url = base_url.clone();
+        c.llm_source = if *base_url == loom_url() {
+            Source::Remote
+        } else if base_url == COMPOSE_LLM {
+            Source::Compose
+        } else {
+            Source::Local
+        };
+        let TtsConfig::OpenAi {
+            base_url,
+            model,
+            voice,
+            ..
+        } = &cfg.tts;
+        c.tts_url = base_url.clone();
+        c.tts_model = model.clone();
+        if *base_url != pocket_url() {
+            c.tts_voice = voice.clone();
         }
-        match &cfg.tts {
-            TtsConfig::Kokoro { voice, .. } => {
-                c.tts_kind = TtsKind::Embedded;
-                c.kokoro_voice = voice.clone();
+        c.tts_source = if *base_url == pocket_url() {
+            c.pocket_voice = voice.clone();
+            Source::Remote
+        } else if base_url == COMPOSE_TTS {
+            Source::Compose
+        } else {
+            Source::Local
+        };
+        if let Some(stack) = &cfg.stack {
+            c.profile = stack.profile;
+            c.tier = Tier::from_profile(stack.profile);
+            c.llm_file = stack.llm_file.clone();
+            match catalogue::find_by_file(&stack.whisper_file) {
+                Some(e) => c.whisper_model = e.id.into(),
+                None => c.whisper_override = Some(stack.whisper_file.clone()),
             }
-            TtsConfig::OpenAi {
-                base_url,
-                model,
-                voice,
-                ..
-            } => {
-                c.tts_url = base_url.clone();
-                c.tts_model = model.clone();
-                c.tts_voice = voice.clone();
-                c.tts_kind = if *base_url == pocket_url() {
-                    TtsKind::Pocket
-                } else {
-                    TtsKind::Http
-                };
-            }
+        } else if [c.stt_source, c.llm_source, c.tts_source]
+            .iter()
+            .all(|s| *s == Source::Remote)
+        {
+            c.tier = Tier::Thin;
+        } else if cfg!(target_os = "macos") {
+            c.tier = Tier::Metal;
         }
         c.base = cfg.clone();
         c
@@ -397,25 +394,59 @@ impl Choices {
         catalogue::find(&self.whisper_model)
     }
 
+    /// The whisper file the stack serves.
+    pub fn whisper_file(&self) -> String {
+        self.whisper_override
+            .clone()
+            .or_else(|| self.whisper_entry().map(|e| e.file.to_string()))
+            .unwrap_or_else(|| DEFAULT_WHISPER_FILE.into())
+    }
+
+    /// The source of `slot`.
+    pub fn source(&self, slot: Slot) -> Source {
+        match slot {
+            Slot::Stt => self.stt_source,
+            Slot::Llm => self.llm_source,
+            Slot::Tts => self.tts_source,
+        }
+    }
+
+    /// The slots served by the compose stack.
+    pub fn stack_slots(&self) -> Vec<Slot> {
+        [Slot::Stt, Slot::Llm, Slot::Tts]
+            .into_iter()
+            .filter(|s| self.source(*s) == Source::Compose)
+            .collect()
+    }
+
+    /// The `[stack]` table, when any slot uses the stack.
+    pub fn stack(&self) -> Option<Stack> {
+        (!self.stack_slots().is_empty()).then(|| Stack {
+            profile: self.profile,
+            whisper_file: self.whisper_file(),
+            llm_file: self.llm_file.clone(),
+        })
+    }
+
     /// The forwards the choices need (named `loom`, `pocket`, `nemotron`),
     /// followed by any custom forwards carried over from the previous config.
     pub fn forwards(&self) -> Vec<Forward> {
         let mut out = Vec::new();
-        if self.stt_kind == SttKind::Nemotron {
+        if self.stt_source == Source::Remote {
             out.push(Forward {
                 name: "nemotron".into(),
                 local_port: NEMOTRON_PORT,
                 remote: "127.0.0.1:8897".into(),
             });
         }
-        if self.llm_kind == LlmKind::Loom {
+        if self.llm_source == Source::Remote {
             out.push(Forward {
                 name: "loom".into(),
                 local_port: LOOM_PORT,
                 remote: "127.0.0.1:8084".into(),
             });
         }
-        if self.tts_kind == TtsKind::Pocket {
+        if self.tts_source == Source::Remote {
             out.push(Forward {
                 name: "pocket".into(),
                 local_port: POCKET_PORT,
@@ -436,30 +467,13 @@ impl Choices {
     /// Models the current choices need on disk.
     pub fn required_models(&self) -> Vec<&'static Entry> {
         let mut v = Vec::new();
-        if self.stt_kind == SttKind::Embedded
-            && self.whisper_path_override.is_none()
+        if self.stt_source == Source::Compose
+            && self.whisper_override.is_none()
             && let Some(e) = self.whisper_entry()
         {
             v.push(e);
         }
-        if self.tts_kind == TtsKind::Embedded {
-            v.extend(
-                ["kokoro-model", "kokoro-voices"]
-                    .iter()
-                    .filter_map(|id| catalogue::find(id)),
-            );
-        }
         v
-    }
-
-    fn threads(&self) -> u16 {
-        if let SttConfig::Whisper { threads, .. } = &self.base.stt {
-            return *threads;
-        }
-        let n = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        (n / 2).clamp(2, 8) as u16
     }
 
     /// Builds the configuration.
@@ -473,89 +487,59 @@ impl Choices {
         cfg.hotkey.mute = self.hotkey_accel.clone();
         cfg.audio.max_utterance_ms = self.max_utterance_ms;
         cfg.models_dir = self.models_dir.clone();
-        cfg.stt = match self.stt_kind {
-            SttKind::Embedded => {
-                let entry = self.whisper_entry();
-                let path = self.whisper_path_override.clone().unwrap_or_else(|| {
-                    self.models_dir
-                        .join(entry.map_or("ggml-base.en-q8_0.bin", |e| e.file))
-                        .to_string_lossy()
-                        .into_owned()
-                });
-                let english_only = Path::new(&path)
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .is_some_and(|f| f.contains(".en"));
-                // Keep a hand-edited language while the model file is unchanged.
-                let language = match &self.base.stt {
-                    SttConfig::Whisper {
-                        model_path,
-                        language,
-                        ..
-                    } if *model_path == path => language.clone(),
-                    _ => english_only.then(|| "en".to_string()),
-                };
-                SttConfig::Whisper {
-                    model_path: path,
-                    language,
-                    threads: self.threads(),
-                    gpu: self.tier.gpu(),
-                }
-            }
-            SttKind::Http => SttConfig::OpenAi {
+        cfg.stack = self.stack();
+        let base_stt_key = match &self.base.stt {
+            SttConfig::OpenAi { api_key_env, .. } => api_key_env.clone(),
+            SttConfig::Nemotron { .. } => None,
+        };
+        cfg.stt = match self.stt_source {
+            Source::Compose => SttConfig::OpenAi {
+                base_url: COMPOSE_STT.into(),
+                model: self.stt_model.clone(),
+                api_key_env: None,
+            },
+            Source::Local => SttConfig::OpenAi {
                 base_url: self.stt_url.clone(),
                 model: self.stt_model.clone(),
-                api_key_env: match &self.base.stt {
-                    SttConfig::OpenAi { api_key_env, .. } => api_key_env.clone(),
-                    _ => None,
-                },
+                api_key_env: base_stt_key,
             },
-            SttKind::Nemotron => SttConfig::Nemotron {
+            Source::Remote => SttConfig::Nemotron {
                 url: nemotron_url(),
             },
         };
-        let (base_url, extra) = match self.llm_kind {
-            LlmKind::Local => (self.llm_url.clone(), Map::new()),
-            LlmKind::Compose => (COMPOSE_LLM.to_string(), Map::new()),
-            LlmKind::Loom => (loom_url(), loom_extra()),
+        let (base_url, extra) = match self.llm_source {
+            Source::Local => (self.llm_url.clone(), Map::new()),
+            Source::Compose => (COMPOSE_LLM.to_string(), Map::new()),
+            Source::Remote => (loom_url(), loom_extra()),
         };
-        let api_key_env = match &self.base.llm {
-            LlmConfig::OpenAi { api_key_env, .. } => api_key_env.clone(),
-        };
+        let LlmConfig::OpenAi { api_key_env, .. } = &self.base.llm;
         cfg.llm = LlmConfig::OpenAi {
             base_url,
             model: self.llm_model.clone(),
-            api_key_env,
+            api_key_env: api_key_env.clone(),
             extra,
         };
-        let base_tts_key = match &self.base.tts {
-            TtsConfig::OpenAi { api_key_env, .. } => api_key_env.clone(),
-            _ => None,
-        };
-        cfg.tts = match self.tts_kind {
-            TtsKind::Embedded => TtsConfig::Kokoro {
-                model_path: self
-                    .models_dir
-                    .join(catalogue::find("kokoro-model").map_or("", |e| e.file))
-                    .to_string_lossy()
-                    .into_owned(),
-                voices_path: self
-                    .models_dir
-                    .join(catalogue::find("kokoro-voices").map_or("", |e| e.file))
-                    .to_string_lossy()
-                    .into_owned(),
-                voice: self.kokoro_voice.clone(),
+        let TtsConfig::OpenAi {
+            api_key_env: base_tts_key,
+            ..
+        } = &self.base.tts;
+        cfg.tts = match self.tts_source {
+            Source::Compose => TtsConfig::OpenAi {
+                base_url: COMPOSE_TTS.into(),
+                model: self.tts_model.clone(),
+                voice: self.tts_voice.clone(),
+                api_key_env: None,
             },
-            TtsKind::Http => TtsConfig::OpenAi {
+            Source::Local => TtsConfig::OpenAi {
                 base_url: self.tts_url.clone(),
                 model: self.tts_model.clone(),
                 voice: self.tts_voice.clone(),
                 api_key_env: base_tts_key.clone(),
             },
-            TtsKind::Pocket => TtsConfig::OpenAi {
+            Source::Remote => TtsConfig::OpenAi {
                 base_url: pocket_url(),
                 model: "pocket-tts".into(),
-                voice: self.tts_voice.clone(),
+                voice: self.pocket_voice.clone(),
                 api_key_env: base_tts_key.clone(),
             },
         };
@@ -572,17 +556,24 @@ impl Choices {
             p.push("ssh destination must not start with '-' or contain whitespace".into());
         }
         let http = |u: &str| u.starts_with("http://") || u.starts_with("https://");
-        if self.stt_kind == SttKind::Http && !http(&self.stt_url) {
+        if self.stt_source == Source::Local && !http(&self.stt_url) {
             p.push("STT URL must start with http:// or https://".into());
         }
-        if self.llm_kind == LlmKind::Local && !http(&self.llm_url) {
+        if self.llm_source == Source::Local && !http(&self.llm_url) {
             p.push("LLM URL must start with http:// or https://".into());
         }
-        if self.tts_kind == TtsKind::Http && !http(&self.tts_url) {
+        if self.tts_source == Source::Local && !http(&self.tts_url) {
             p.push("TTS URL must start with http:// or https://".into());
         }
         if self.llm_model.trim().is_empty() {
             p.push("LLM model name is empty".into());
+        }
+        if self.llm_source == Source::Compose
+            && (self.llm_file.trim().is_empty() || self.llm_file.contains('/'))
+        {
+            p.push(
+                "the GGUF file name must be a plain file name inside the models directory".into(),
+            );
         }
         if !(1000..=MAX_UTTERANCE_CAP_MS).contains(&self.max_utterance_ms) {
             p.push(format!(
@@ -604,6 +595,20 @@ impl Choices {
     /// Mutable access to the passed-through connection settings (headless flags).
     pub fn connection_mut(&mut self) -> &mut Connection {
         &mut self.base.connection
+    }
+}
+
+/// Default `(stt, llm, tts)` sources for `tier`.
+fn tier_sources(tier: Tier) -> (Source, Source, Source) {
+    match tier {
+        Tier::RocmLarge | Tier::Nvidia | Tier::SmallGpu => {
+            (Source::Compose, Source::Compose, Source::Compose)
+        }
+        // CPU inference of the concierge model is slow: use the agentbox Loom.
+        Tier::Cpu => (Source::Compose, Source::Remote, Source::Compose),
+        // Docker on macOS has no GPU: native servers (whisper.cpp, Ollama, LM Studio).
+        Tier::Metal => (Source::Local, Source::Local, Source::Remote),
+        Tier::Thin => (Source::Remote, Source::Remote, Source::Remote),
     }
 }
 
@@ -634,6 +639,10 @@ pub fn loom_extra() -> Map<String, Value> {
 mod tests {
     use super::*;
 
+    fn defaults(t: Tier) -> Choices {
+        Choices::defaults_for(t, "laptop")
+    }
+
     #[test]
     fn tier_defaults_follow_the_brief() {
         assert_eq!(
@@ -646,20 +655,31 @@ mod tests {
             if let Some(id) = t.default_whisper() {
                 assert!(catalogue::find(id).is_some(), "{id}");
             }
+            assert_eq!(Tier::from_profile(t.profile()).profile(), t.profile());
         }
     }
 
     #[test]
-    fn loom_forward_and_url_derivation() {
-        let mut c = Choices::defaults_with(
-            crate::setup::choices::Engines {
-                whisper: true,
-                kokoro: true,
-            },
-            Tier::Cpu,
-            "laptop",
+    fn tiers_map_to_profiles_and_sources() {
+        let gpu = defaults(Tier::Nvidia);
+        assert_eq!(gpu.profile, ComposeProfile::Cuda);
+        assert_eq!(gpu.stack_slots(), [Slot::Stt, Slot::Llm, Slot::Tts]);
+        let cpu = defaults(Tier::Cpu);
+        assert_eq!(cpu.profile, ComposeProfile::Cpu);
+        assert_eq!(cpu.llm_source, Source::Remote);
+        assert_eq!(cpu.stack_slots(), [Slot::Stt, Slot::Tts]);
+        let mac = defaults(Tier::Metal);
+        assert_eq!(
+            (mac.stt_source, mac.llm_source, mac.tts_source),
+            (Source::Local, Source::Local, Source::Remote)
         );
-        assert_eq!(c.llm_kind, LlmKind::Loom);
+        assert!(mac.stack().is_none() && mac.to_config().stack.is_none());
+    }
+
+    #[test]
+    fn loom_forward_and_url_derivation() {
+        let mut c = defaults(Tier::Cpu);
+        assert_eq!(c.llm_source, Source::Remote);
         let f = c.forwards();
         assert_eq!(
             f,
@@ -678,20 +698,13 @@ mod tests {
             serde_json::Value::Object(extra.clone()),
             json!({"loom_options": {"scaffold": false}})
         );
-        c.llm_kind = LlmKind::Local;
+        c.llm_source = Source::Local;
         assert!(c.forwards().is_empty());
     }
 
     #[test]
-    fn thin_client_uses_three_forwards() {
-        let c = Choices::defaults_with(
-            crate::setup::choices::Engines {
-                whisper: true,
-                kokoro: true,
-            },
-            Tier::Thin,
-            "laptop",
-        );
+    fn thin_client_uses_three_forwards_and_no_stack() {
+        let c = defaults(Tier::Thin);
         let names: Vec<_> = c
             .forwards()
             .into_iter()
@@ -712,125 +725,83 @@ mod tests {
                 url: "ws://127.0.0.1:18897/api/asr-streaming".into()
             }
         );
-        assert!(c.required_models().is_empty());
+        assert!(c.required_models().is_empty() && cfg.stack.is_none());
         for f in &cfg.connection.forwards {
             assert!(f.local_port > 1024);
         }
     }
 
     #[test]
-    fn embedded_tiers_need_models() {
-        let c = Choices::defaults_with(
-            crate::setup::choices::Engines {
-                whisper: true,
-                kokoro: true,
-            },
-            Tier::Nvidia,
-            "x",
-        );
+    fn compose_slots_need_the_whisper_model_and_write_the_stack() {
+        let c = defaults(Tier::Nvidia);
         let ids: Vec<_> = c.required_models().iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec!["whisper-medium-q8"]);
+        let cfg = c.to_config();
         assert_eq!(
-            ids,
-            vec!["whisper-medium-q8", "kokoro-model", "kokoro-voices"]
+            cfg.stack,
+            Some(Stack {
+                profile: ComposeProfile::Cuda,
+                whisper_file: "ggml-medium-q8_0.bin".into(),
+                llm_file: "llm.gguf".into()
+            })
         );
-        let SttConfig::Whisper {
-            model_path,
-            gpu,
-            language,
-            ..
-        } = c.to_config().stt
-        else {
-            panic!()
-        };
-        assert!(model_path.ends_with("ggml-medium-q8_0.bin"));
-        assert!(gpu);
-        assert_eq!(language, None);
-        let SttConfig::Whisper { language, gpu, .. } = Choices::defaults_with(
-            crate::setup::choices::Engines {
-                whisper: true,
-                kokoro: true,
-            },
-            Tier::Cpu,
-            "x",
-        )
-        .to_config()
-        .stt
-        else {
-            panic!()
-        };
-        assert_eq!(language.as_deref(), Some("en"));
-        assert!(!gpu);
+        assert!(matches!(&cfg.stt, SttConfig::OpenAi { base_url, .. } if base_url == COMPOSE_STT));
+        let TtsConfig::OpenAi {
+            base_url, voice, ..
+        } = &cfg.tts;
+        assert_eq!(
+            (base_url.as_str(), voice.as_str()),
+            (COMPOSE_TTS, "af_heart")
+        );
     }
 
     #[test]
     fn from_config_round_trips_through_choices() {
         for tier in Tier::ALL {
-            let mut c = Choices::defaults_with(
-                crate::setup::choices::Engines {
-                    whisper: true,
-                    kokoro: true,
-                },
-                tier,
-                "host",
-            );
+            let mut c = defaults(tier);
             c.hotkey_enabled = true;
             c.input_device = Some("USB Mic".into());
             let cfg = c.to_config();
             let back = Choices::from_config(&cfg);
             assert_eq!(back.to_config(), cfg, "{tier:?}");
-            assert_eq!(back.stt_kind, c.stt_kind);
-            assert_eq!(back.llm_kind, c.llm_kind);
-            assert_eq!(back.tts_kind, c.tts_kind);
+            assert_eq!(back.stt_source, c.stt_source);
+            assert_eq!(back.llm_source, c.llm_source);
+            assert_eq!(back.tts_source, c.tts_source);
         }
     }
 
     #[test]
     fn hand_edits_survive_a_rerun() {
-        let mut cfg = Choices::defaults_with(
-            crate::setup::choices::Engines {
-                whisper: true,
-                kokoro: true,
-            },
-            Tier::Cpu,
-            "h",
-        )
-        .to_config();
-        let model = catalogue::find("whisper-small-q8").unwrap().file;
-        let path = cfg.models_dir.join(model).to_string_lossy().into_owned();
-        cfg.stt = SttConfig::Whisper {
-            model_path: path,
-            language: Some("de".into()),
-            threads: 3,
-            gpu: false,
-        };
+        let mut cfg = defaults(Tier::Cpu).to_config();
+        cfg.stack.as_mut().unwrap().whisper_file = "my-finetune.bin".into();
         cfg.tts = TtsConfig::OpenAi {
             base_url: COMPOSE_TTS.into(),
             model: "kokoro".into(),
             voice: "bf_emma".into(),
-            api_key_env: Some("TTS_KEY".into()),
+            api_key_env: None,
         };
         cfg.audio.max_utterance_ms = 12_000;
         let c = Choices::from_config(&cfg);
+        assert_eq!(c.whisper_override.as_deref(), Some("my-finetune.bin"));
+        assert!(
+            c.required_models().is_empty(),
+            "a custom file is not downloaded"
+        );
         assert_eq!(c.to_config(), cfg);
         let mut http = cfg.clone();
         http.stt = SttConfig::OpenAi {
-            base_url: COMPOSE_STT.into(),
+            base_url: "http://127.0.0.1:8080/v1".into(),
             model: "whisper-1".into(),
             api_key_env: Some("STT_KEY".into()),
         };
-        assert_eq!(Choices::from_config(&http).to_config(), http);
+        let back = Choices::from_config(&http);
+        assert_eq!(back.stt_source, Source::Local);
+        assert_eq!(back.to_config().stt, http.stt);
     }
 
     #[test]
     fn utterance_cap_is_enforced() {
-        let mut c = Choices::defaults_with(
-            crate::setup::choices::Engines {
-                whisper: true,
-                kokoro: true,
-            },
-            Tier::Cpu,
-            "h",
-        );
+        let mut c = defaults(Tier::Cpu);
         assert_eq!(c.to_config().audio.max_utterance_ms, 30_000);
         c.max_utterance_ms = 30_001;
         assert!(!c.validate().is_empty());
@@ -839,45 +810,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_whisper_path_is_preserved() {
-        let mut cfg = Choices::defaults_with(
-            crate::setup::choices::Engines {
-                whisper: true,
-                kokoro: true,
-            },
-            Tier::Cpu,
-            "h",
-        )
-        .to_config();
-        cfg.stt = SttConfig::Whisper {
-            model_path: "/opt/custom/model.bin".into(),
-            language: None,
-            threads: 3,
-            gpu: false,
-        };
-        let c = Choices::from_config(&cfg);
-        assert!(
-            c.required_models()
-                .iter()
-                .all(|e| e.kind != catalogue::Kind::Whisper)
-        );
-        let SttConfig::Whisper { model_path, .. } = c.to_config().stt else {
-            panic!()
-        };
-        assert_eq!(model_path, "/opt/custom/model.bin");
-    }
-
-    #[test]
     fn custom_forwards_survive_and_validation_catches_bad_input() {
-        let mut cfg = Choices::defaults_with(
-            crate::setup::choices::Engines {
-                whisper: true,
-                kokoro: true,
-            },
-            Tier::Cpu,
-            "h",
-        )
-        .to_config();
+        let mut cfg = defaults(Tier::Cpu).to_config();
         cfg.connection.forwards.push(Forward {
             name: "extra".into(),
             local_port: 19000,
@@ -889,29 +823,52 @@ mod tests {
         c.ssh_destination = "-oProxyCommand=x".into();
         assert!(!c.validate().is_empty());
         c.ssh_destination = "a@b".into();
-        c.llm_kind = LlmKind::Local;
+        c.llm_source = Source::Local;
         c.llm_url = "ftp://x".into();
+        assert!(!c.validate().is_empty());
+        c.llm_url = LOCAL_LLM.into();
+        c.llm_source = Source::Compose;
+        c.llm_file = "../etc/passwd".into();
         assert!(!c.validate().is_empty());
     }
 
     #[test]
-    fn cycle_wraps() {
+    fn remote_tts_uses_a_pocket_voice_not_a_kokoro_one() {
+        // Pocket TTS rejects Kokoro voice names (`af_heart` is a 400 there).
+        let mut c = defaults(Tier::Thin);
+        let voice = |c: &Choices| match c.to_config().tts {
+            TtsConfig::OpenAi { voice, .. } => voice,
+        };
+        assert_eq!(voice(&c), "alba");
+        c.tts_source = Source::Compose;
+        assert_eq!(voice(&c), "af_heart");
+        c.pocket_voice = "jane".into();
+        c.tts_source = Source::Remote;
+        let back = Choices::from_config(&c.to_config());
         assert_eq!(
-            cycle(SttKind::ALL, SttKind::Embedded, -1),
-            SttKind::Nemotron
+            (back.pocket_voice.as_str(), back.tts_voice.as_str()),
+            ("jane", "af_heart")
         );
-        assert_eq!(cycle(SttKind::ALL, SttKind::Nemotron, 1), SttKind::Embedded);
     }
 
     #[test]
-    fn builds_without_embedded_engines_default_to_the_agentbox_speech_plane() {
-        let none = Engines {
-            whisper: false,
-            kokoro: false,
-        };
-        let c = Choices::defaults_with(none, Tier::RocmLarge, "laptop");
-        assert_eq!(c.stt_kind, SttKind::Nemotron);
-        assert_eq!(c.tts_kind, TtsKind::Pocket);
-        assert!(c.required_models().is_empty());
+    fn aarch64_cannot_take_speech_to_text_from_the_stack() {
+        let mut c = defaults(Tier::SmallGpu);
+        assert_eq!(c.apply_arch("aarch64"), [Slot::Stt]);
+        assert_eq!(
+            (c.stt_source, c.llm_source, c.tts_source),
+            (Source::Remote, Source::Compose, Source::Compose)
+        );
+        let mut x = defaults(Tier::SmallGpu);
+        assert!(x.apply_arch("x86_64").is_empty());
+        assert_eq!(x.stt_source, Source::Compose);
+        let mut r = defaults(Tier::RocmLarge);
+        assert_eq!(r.apply_arch("aarch64"), [Slot::Stt, Slot::Llm]);
+    }
+
+    #[test]
+    fn cycle_wraps() {
+        assert_eq!(cycle(Source::ALL, Source::Compose, -1), Source::Remote);
+        assert_eq!(cycle(Source::ALL, Source::Remote, 1), Source::Compose);
     }
 }

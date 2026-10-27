@@ -41,7 +41,7 @@ pub fn spawn(effect: Effect, tx: Sender<Outcome>, ctl: &Controls) {
 fn run(effect: Effect, tx: &Sender<Outcome>, ctl: &Controls) -> Vec<Outcome> {
     match effect {
         Effect::Probe => vec![Outcome::Hardware(probe::probe())],
-        Effect::DetectLlm => vec![Outcome::Detected(net::detect_llm_servers())],
+        Effect::Detect => vec![Outcome::Detected(net::detect_servers())],
         Effect::ToolProbe {
             base_url,
             model,
@@ -86,6 +86,19 @@ fn run(effect: Effect, tx: &Sender<Outcome>, ctl: &Controls) -> Vec<Outcome> {
                 }
             }
             vec![lines("download", ok, report)]
+        }
+        Effect::StartStack(cmd) => {
+            // The wizard only emits this after an explicit second Enter.
+            let (ok, tail) = cmd.run_captured();
+            let mut report = vec![format!("ran: {}", cmd.display())];
+            report.extend(tail);
+            if ok {
+                report.push(
+                    "Started. The first image pull can take a while: check progress with `docker compose ps`."
+                        .into(),
+                );
+            }
+            vec![lines("stack", ok, report)]
         }
         Effect::CheckSsh(conn) => match remote::check_version(&conn) {
             remote::Verdict::Ready(v) => vec![lines(

@@ -33,7 +33,7 @@ rubato = "5"
 aec3 = "0.4"
 earshot = "1"
 cpal = { version = "0.18", optional = true }
-global-hotkey = "0.9"
+global-hotkey = { version = "0.9", optional = true }
 ratatui = "0.30"
 ureq = { version = "3", features = ["json"] }
 sha2 = "0.10"
@@ -48,15 +48,13 @@ alsa = { version = "0.11", optional = true }
 tempfile = "3"
 
 [features]
-default = ["audio-io"]
+default = ["audio-io", "hotkey"]
 # Real audio devices through cpal (needs ALSA headers on Linux). Without it the
 # pipeline still builds and its state machine is tested on synthetic buffers.
 audio-io = ["dep:cpal", "dep:alsa"]
-# Embedded engines, forwarded to voicelink-backends. Without them STT/TTS run over HTTP.
-whisper = ["voicelink-backends/whisper"]
-whisper-vulkan = ["voicelink-backends/whisper-vulkan"]
-whisper-metal = ["voicelink-backends/whisper-metal"]
-kokoro = ["voicelink-backends/kokoro"]
+# Global mute hotkey (pulls X11 libraries on Linux). Off, the hotkey config is
+# accepted and a warning says the build lacks hotkey support.
+hotkey = ["dep:global-hotkey"]
 
 [lints]
 workspace = true

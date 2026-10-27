@@ -1,44 +1,34 @@
 # voicelink-backends
 
-Interchangeable speech-to-text, tool-calling chat and text-to-speech backends
-behind three small async traits, chosen at runtime from a serde config enum.
-No audio device I/O, no terminal handling: it turns audio into text, text into
-a model reply (with tool calls) and text into audio.
+Speech-to-text, tool-calling chat and text-to-speech clients behind three small
+async traits, chosen at runtime from a serde config enum. Everything is reached
+over HTTP or WebSocket: there are no embedded inference engines, so GPU
+runtimes (ROCm, CUDA, Vulkan, Metal) stay in the model server and never in the
+client binary. No audio device I/O, no terminal handling.
 
 | Slot | Trait | Backends |
 |---|---|---|
-| STT | `SpeechToText` | embedded whisper.cpp (`whisper*` features); OpenAI `/v1/audio/transcriptions`; Nemotron streaming ASR (WebSocket + MessagePack) |
+| STT | `SpeechToText` | OpenAI `/v1/audio/transcriptions` (whisper.cpp `whisper-server`, speaches, OpenAI); Nemotron streaming ASR (WebSocket + MessagePack, 30 s utterance guard) |
 | Chat | `ChatModel` | OpenAI `/v1/chat/completions` with tool calls (llama-server, Ollama, LM Studio, gateways); extra top-level request fields via `extra` |
-| TTS | `TextToSpeech` | embedded Kokoro-82M (`kokoro`); OpenAI `/v1/audio/speech` with streamed PCM (Kokoro-FastAPI, Pocket TTS), WAV fallback |
+| TTS | `TextToSpeech` | OpenAI `/v1/audio/speech` with streamed PCM (Kokoro-FastAPI, Pocket TTS), WAV fallback |
 
-## Cargo features
+## Features
 
-| Feature | Default | Effect |
-|---|---|---|
-| `whisper` | off | Embedded whisper.cpp on the CPU via `whisper-rs`. Needs `cmake`, a C++ compiler and libclang at build time. |
-| `kokoro` | off | Embedded Kokoro-82M TTS (CPU) via ONNX Runtime. See below. |
-| `whisper-vulkan` | off | `whisper` plus the Vulkan GPU backend. |
-| `whisper-metal` | off | `whisper` plus the Metal GPU backend. |
+None. HTTP and WebSocket use `reqwest` and `tokio-tungstenite` with rustls (no
+OpenSSL). The minimum supported Rust version is 1.85 (derived from the edition
+and the dependency set; CI builds with the current stable toolchain).
 
-HTTP and WebSocket backends are always available (`reqwest` and
-`tokio-tungstenite` with rustls; no OpenSSL). CUDA and ROCm are deliberately
-not linked: reach them through an HTTP model server built for that runtime.
+## Health checks
 
-Without a `whisper*` feature, `build_stt` returns `BackendError::Config` for
-`SttConfig::Whisper`.
+`probe_stt`, `probe_llm` and `probe_tts` make one cheap reachability check,
+bounded by `PROBE_TIMEOUT` (3 s), and name the URL in every error:
 
-## Embedded Kokoro
-
-The `kokoro` feature runs Kokoro-82M in-process through ONNX Runtime (`ort`),
-with the ONNX model and voices file (`.npz`) from the
-[kokoro-onnx releases](https://github.com/thewh1teagle/kokoro-onnx/releases).
-Phonemisation is `misaki-rs` with its `espeak` feature **off**: espeak-ng is
-GPL-3.0 and would taint this crate's `Apache-2.0 OR MIT` licence. The
-consequence is that words absent from the bundled dictionaries are spelled
-letter by letter; for full-coverage pronunciation run Kokoro-FastAPI and use
-`TtsConfig::OpenAi`. The feature downloads a prebuilt ONNX Runtime at build time
-and needs Rust 1.92. ONNX Runtime allows one environment per process, so it
-cannot share a process with other code that initialises `ort` itself.
+- OpenAI-style servers: `GET {base_url}/models`. 2xx, 404 and 405 count as up
+  (several speech servers have no model listing); 401/403 and 5xx are errors;
+  a refused or timed-out connection is a `Transport` error.
+- Nemotron: open the WebSocket, wait for the server's first frame (`Ready`, or
+  `Error` when another client is streaming, which still proves it is alive) and
+  close.
 
 ## Example
 
