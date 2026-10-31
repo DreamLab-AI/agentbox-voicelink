@@ -134,9 +134,17 @@ fn build_input(
     }
     let stream = match supported.sample_format() {
         SampleFormat::F32 => build!(f32),
+        SampleFormat::F64 => build!(f64),
+        SampleFormat::I8 => build!(i8),
         SampleFormat::I16 => build!(i16),
-        SampleFormat::U16 => build!(u16),
+        SampleFormat::I24 => build!(cpal::I24),
         SampleFormat::I32 => build!(i32),
+        SampleFormat::I64 => build!(i64),
+        SampleFormat::U8 => build!(u8),
+        SampleFormat::U16 => build!(u16),
+        SampleFormat::U24 => build!(cpal::U24),
+        SampleFormat::U32 => build!(u32),
+        SampleFormat::U64 => build!(u64),
         other => bail!("unsupported input sample format {other}"),
     };
     Ok(stream)
@@ -170,9 +178,17 @@ fn build_output(
     }
     let stream = match supported.sample_format() {
         SampleFormat::F32 => build!(f32),
+        SampleFormat::F64 => build!(f64),
+        SampleFormat::I8 => build!(i8),
         SampleFormat::I16 => build!(i16),
-        SampleFormat::U16 => build!(u16),
+        SampleFormat::I24 => build!(cpal::I24),
         SampleFormat::I32 => build!(i32),
+        SampleFormat::I64 => build!(i64),
+        SampleFormat::U8 => build!(u8),
+        SampleFormat::U16 => build!(u16),
+        SampleFormat::U24 => build!(cpal::U24),
+        SampleFormat::U32 => build!(u32),
+        SampleFormat::U64 => build!(u64),
         other => bail!("unsupported output sample format {other}"),
     };
     Ok(stream)

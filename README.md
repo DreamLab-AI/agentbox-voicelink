@@ -78,7 +78,9 @@ service, when one is running, so every PipeWire source and sink is selectable
 without taking the hardware away from other apps. A device can also be named by
 its node name (`wpctl inspect <id>` shows `node.name`; `pactl list short sources`
 prints it), which survives a description change. Without a sound server it
-falls back to plain ALSA devices.
+falls back to plain ALSA devices. Any PCM sample format the device offers
+(8-, 16-, 24-, 32- or 64-bit integer, or float) is accepted, so 24-bit USB
+microphones work without changing the server's sample format.
 
 ### Build from source
 
