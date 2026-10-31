@@ -467,6 +467,9 @@ impl PtyClient {
         let mut child = StdCommand::new("script");
         child
             .args(["-qec", &inner, "/dev/null"])
+            // `script -c` runs `inner` through $SHELL; an interactive login
+            // shell's startup files must not get between it and tmux.
+            .env("SHELL", "/bin/sh")
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
             .env("TMUX_TMPDIR", server.dir.path())
